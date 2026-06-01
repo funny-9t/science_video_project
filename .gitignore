@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Project specific - outputs (large generated files)
+science_video_project/outputs/
+science_video_project/data/videos/
+science_video_project/data/*.csv
+
+# Model files (large pre-trained weights)
+chinese-robeta-wwm-ext/
+faster-whisper-large-v2/
+openaiclip-vit-large-patch14/
+
+# COVER outputs
+cover_outputs/
+
+# Logs
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Environment files
+.env
+*.env.local

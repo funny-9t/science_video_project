@@ -1,0 +1,12 @@
+torch
+transformers
+safetensors
+faster-whisper
+openai-whisper
+openai-clip
+opencv-python
+pillow
+numpy
+pandas
+scikit-learn
+tqdm
