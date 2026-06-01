@@ -126,6 +126,7 @@ class MultiModalQualityModel(nn.Module):
         audio_feat: torch.Tensor,
         meta_feat: torch.Tensor,
         aes_feat: torch.Tensor | None = None,
+        **_kwargs,  # 兼容研究版新增字段 (sci_hand_feat, frame_features, engagement_target)
     ) -> dict[str, torch.Tensor]:
         sci_h, sci_s = self.scientific_branch(text_feat, meta_feat)
         tech_h, tech_s = self.technical_branch(video_feat, audio_feat, meta_feat)
