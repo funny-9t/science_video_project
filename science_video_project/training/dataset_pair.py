@@ -70,6 +70,9 @@ class PairwiseVideoDataset(Dataset):
             "audio_feat": torch.tensor(sample["audio_feat"], dtype=torch.float32),
             "meta_feat": torch.tensor(sample["meta_feat"], dtype=torch.float32),
             "aes_feat": torch.tensor(sample.get("aes_feat", np.zeros(7, dtype=np.float32)), dtype=torch.float32),
+            "sci_hand_feat": torch.tensor(sample.get("sci_hand_feat", np.zeros(5, dtype=np.float32)), dtype=torch.float32),
+            "frame_features": torch.tensor(sample.get("frame_features", np.zeros((0, 512), dtype=np.float32)), dtype=torch.float32),
+            "engagement_target": torch.tensor([sample.get("engagement_target", 0.0)], dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:

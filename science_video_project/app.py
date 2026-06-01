@@ -1,7 +1,13 @@
 """
-Flask应用 - 科学视频质量评分推理服务
+Flask应用 - 科学视频质量评分推理服务 (Research Edition)
+
+支持 MVP 模型 (MultiModalQualityModel) 和研究版模型 (ResearchModel)。
+通过 --research 参数指定加载研究版 checkpoint。
 """
+
+import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -19,77 +25,112 @@ from pipeline.config import CFG
 from pipeline.step_audio import AudioEncoder
 from pipeline.step_extract import VideoExtractor
 from pipeline.step_meta import MetaFeatureBuilder
+from pipeline.step_science_features import ScienceFeatureExtractor
 from pipeline.step_text import TextEncoder
 from pipeline.step_video import VideoEncoder
 from pipeline.utils_io import ensure_dir, get_video_id
-from training.model_mvp import MultiModalQualityModel
 from training.utils_train import adapt_checkpoint_state_dict, get_device
 
+# 模型类型
+_USE_RESEARCH = os.environ.get("RESEARCH_MODE", "0") == "1"
+if _USE_RESEARCH:
+    from training.model_research import ResearchModel as QualityModel
+else:
+    from training.model_mvp import MultiModalQualityModel as QualityModel
 
-app = Flask(__name__, 
+
+app = Flask(__name__,
             template_folder='frontend',
             static_folder='frontend/static')
 CORS(app)
 
-# 全局变量 - 缓存加载的模型和编码器
+# 全局变量
 _model = None
 _device = None
 _text_encoder = None
 _audio_encoder = None
 _video_encoder = None
 _meta_builder = None
+_sci_extractor = None  # §7 新增
+_aes_scorer = None     # §8 新增 (用于 app 推理时提取 aes_feat)
 
 
 def init_models():
-    """初始化所有模型和编码器"""
-    global _model, _device, _text_encoder, _audio_encoder, _video_encoder, _meta_builder
-    
+    """初始化所有模型和编码器。支持 MVP 和 Research 两种模式。"""
+    global _model, _device, _text_encoder, _audio_encoder, _video_encoder
+    global _meta_builder, _sci_extractor, _aes_scorer
+
     try:
-        # 获取设备
         _device = get_device(CFG.device)
         print(f"Using device: {_device}")
-        
-        # 加载多模态模型
-        _model = MultiModalQualityModel(
-            text_dim=CFG.text_dim,
-            video_dim=CFG.video_dim,
-            audio_dim=CFG.audio_dim,
-            meta_dim=CFG.meta_dim,
-            hidden_dim=CFG.hidden_dim,
-        ).to(_device)
-        
-        checkpoint_path = CFG.checkpoint_dir / "best.pt"
+
+        # 加载模型
+        if _USE_RESEARCH:
+            _model = QualityModel(
+                text_dim=CFG.text_dim, video_dim=CFG.video_dim,
+                audio_dim=CFG.audio_dim, meta_dim=CFG.meta_dim,
+                aes_dim=CFG.aes_dim, sci_hand_dim=CFG.sci_hand_dim,
+                hidden_dim=CFG.hidden_dim,
+                use_quality_head=CFG.use_quality_head,
+                use_engagement_branch=CFG.use_engagement_branch,
+                use_science_features=CFG.use_science_features,
+                use_aesthetic_mlp=CFG.use_aesthetic_mlp,
+                use_temporal_encoder=CFG.use_temporal_encoder,
+                use_cross_modal_attention=CFG.use_cross_modal_attention,
+                temporal_dim=CFG.temporal_dim,
+                temporal_arch=CFG.temporal_arch,
+                temporal_num_layers=CFG.temporal_num_layers,
+                temporal_num_heads=CFG.temporal_num_heads,
+                cross_modal_num_heads=CFG.cross_modal_num_heads,
+                cross_modal_dropout=CFG.cross_modal_dropout,
+            ).to(_device)
+            ckpt_name = "research_best.pt"
+        else:
+            _model = QualityModel(
+                text_dim=CFG.text_dim, video_dim=CFG.video_dim,
+                audio_dim=CFG.audio_dim, meta_dim=CFG.meta_dim,
+                hidden_dim=CFG.hidden_dim,
+            ).to(_device)
+            ckpt_name = "best.pt"
+
+        checkpoint_path = CFG.checkpoint_dir / ckpt_name
         if checkpoint_path.exists():
             ckpt = torch.load(checkpoint_path, map_location=_device)
             if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
                 state_dict = ckpt["model_state_dict"]
             else:
                 state_dict = ckpt
-            _model.load_state_dict(adapt_checkpoint_state_dict(state_dict))
-            print(f"✓ Loaded checkpoint from {checkpoint_path}")
+            state_dict = adapt_checkpoint_state_dict(state_dict)
+            # 允许部分匹配加载
+            model_dict = _model.state_dict()
+            matched = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(matched)
+            _model.load_state_dict(model_dict)
+            print(f"✓ Loaded checkpoint from {checkpoint_path} ({len(matched)} keys)")
         else:
             print(f"⚠ Checkpoint not found at {checkpoint_path}")
-        
+
         _model.eval()
-        
-        # 初始化编码器
+
+        # 编码器
         asr_path = Path(CFG.asr_model_path).resolve()
         audio_path = Path(CFG.audio_model_path).resolve()
-        
+
         _text_encoder = TextEncoder(CFG.text_model_name, str(asr_path), _device, CFG.local_files_only)
         _audio_encoder = AudioEncoder(str(audio_path), _device, out_dim=CFG.audio_dim, shared_model=_text_encoder.asr)
         _video_encoder = VideoEncoder(CFG.clip_model_name, _device)
-        
-        # 初始化元数据构建器（使用默认类别）
         _meta_builder = MetaFeatureBuilder(
             categories=["数字智能", "工程制造", "天文宇宙", "医学健康",
                         "自然地理", "动物植物", "农林畜牧", "生物基因", "综合"],
-            out_dim=CFG.meta_dim
+            out_dim=CFG.meta_dim,
         )
-        
+
+        # §7 科学性特征提取器
+        _sci_extractor = ScienceFeatureExtractor()
+
         print("✓ All models initialized successfully")
         return True
-        
+
     except Exception as e:
         print(f"✗ Error initializing models: {e}")
         import traceback
@@ -158,11 +199,17 @@ def api_infer():
         }
         meta_feat = _meta_builder.build(row)
 
+        # 拼接文本 (用于科学性特征)
+        combined_text = " ".join([str(data.get('title', '')), str(data.get('tags', '')), str(data.get('subtitle', ''))])
+
         # --- 3) 提取特征 ---
         feature_source = "simulated"
+        sci_hand_np = np.zeros(CFG.sci_hand_dim, dtype=np.float32)
+        aes_feat_np = np.zeros(CFG.aes_dim, dtype=np.float32)
+        frame_feats_np = np.zeros((0, CFG.video_dim), dtype=np.float32)
+
         if has_file and _video_encoder is not None:
             try:
-                # 保存上传的视频到临时目录
                 upload_dir = CFG.output_dir / "uploads"
                 ensure_dir(upload_dir)
                 video_path = upload_dir / video_file.filename
@@ -189,6 +236,13 @@ def api_infer():
                 text_feat_np = text_result.embedding
                 video_feat_np = video_feat.numpy() if hasattr(video_feat, 'numpy') else video_feat
                 audio_feat_np = audio_feat.numpy() if hasattr(audio_feat, 'numpy') else audio_feat
+
+                # §7 手工科学性特征
+                if _sci_extractor is not None:
+                    sci_hand_np = _sci_extractor.extract_vector(
+                        " ".join([str(data.get('title', '')), str(data.get('tags', '')), str(text_result.subtitle)])
+                    ).numpy()
+
                 feature_source = "real"
                 print(f"  [upload] ✓ Features extracted from {video_path.name}")
             except Exception as ext_e:
@@ -196,7 +250,6 @@ def api_infer():
                 has_file = False
 
         if not has_file:
-            # 使用模拟特征
             text_feat_np = np.random.randn(CFG.text_dim).astype(np.float32)
             video_feat_np = np.random.randn(CFG.video_dim).astype(np.float32)
             audio_feat_np = np.random.randn(CFG.audio_dim).astype(np.float32)
@@ -207,8 +260,14 @@ def api_infer():
         a_t = torch.tensor(audio_feat_np, dtype=torch.float32).unsqueeze(0).to(_device)
         m_t = torch.tensor(meta_feat, dtype=torch.float32).unsqueeze(0).to(_device)
 
+        # 研究版额外特征
+        model_kwargs = {"text_feat": t_t, "video_feat": v_t, "audio_feat": a_t, "meta_feat": m_t}
+        if _USE_RESEARCH:
+            model_kwargs["aes_feat"] = torch.tensor(aes_feat_np, dtype=torch.float32).unsqueeze(0).to(_device)
+            model_kwargs["sci_hand_feat"] = torch.tensor(sci_hand_np, dtype=torch.float32).unsqueeze(0).to(_device)
+
         with torch.no_grad():
-            out = _model(text_feat=t_t, video_feat=v_t, audio_feat=a_t, meta_feat=m_t)
+            out = _model(**model_kwargs)
 
         prob = float(out["probability"].item())
         result = {
@@ -223,15 +282,30 @@ def api_infer():
             "overall_score": float(out["overall_score"].item()),
             "probability": prob,
             "prediction": "上榜" if prob >= CFG.threshold else "未上榜",
-            "engagement": {
-                "likes": int(data.get('like_count', data.get('likeCount', 0))),
-                "shares": int(data.get('share_count', data.get('shareCount', 0))),
-                "collects": int(data.get('collect_count', data.get('collectCount', 0))),
-                "comments": int(data.get('comment_count', data.get('commentCount', 0))),
-                "recommends": int(data.get('recommend_count', data.get('recommendCount', 0))),
-            },
-            "timestamp": datetime.now().isoformat()
         }
+
+        # §12 研究版扩展输出
+        if "quality_score" in out:
+            result["quality_score"] = float(out["quality_score"].item())
+        if "engagement_score" in out:
+            result["engagement_score"] = float(out["engagement_score"].item())
+        if "gate_weights" in out:
+            gw = out["gate_weights"].squeeze(0).cpu().tolist()
+            result["gate_weights"] = {
+                "scientific": float(gw[0]),
+                "technical": float(gw[1]),
+                "aesthetic": float(gw[2]),
+            }
+
+        result["engagement"] = {
+            "likes": int(data.get('like_count', data.get('likeCount', 0))),
+            "shares": int(data.get('share_count', data.get('shareCount', 0))),
+            "collects": int(data.get('collect_count', data.get('collectCount', 0))),
+            "comments": int(data.get('comment_count', data.get('commentCount', 0))),
+            "recommends": int(data.get('recommend_count', data.get('recommendCount', 0))),
+        }
+        result["timestamp"] = datetime.now().isoformat()
+
         return jsonify(result), 200
 
     except Exception as e:

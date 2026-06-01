@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -38,7 +38,33 @@ class Config:
     audio_dim: int = 384
     meta_dim: int = 16
     aes_dim: int = 7             # CLIP prompt scoring dimensions (DEFAULT_PROMPTS)
+    sci_hand_dim: int = 5         # handcrafted scientific features
+    temporal_dim: int = 256       # temporal encoder output dim
     hidden_dim: int = 128
+
+    # ====== Research Flags (§4-§13 of new_prompt.md) ======
+    use_quality_head: bool = True              # §4: quality_score ← MLP(sci,tech,aes)
+    use_consistency_loss: bool = True          # §5: L_cons = MSE(quality, overall)
+    use_engagement_branch: bool = True         # §6: engagement_score (auxiliary)
+    use_science_features: bool = True          # §7: handcrafted scientific features
+    use_aesthetic_mlp: bool = True             # §8: MLP over aes_feat
+    use_temporal_encoder: bool = True          # §9: BiGRU/Transformer over frames
+    use_cross_modal_attention: bool = True     # §10: MultiHeadAttention fusion
+    use_diversity_loss: bool = True            # §11: Branch diversity regularization
+    use_frame_features: bool = True            # Save per-frame CLIP features (for temporal)
+
+    # loss weights
+    lambda_consistency: float = 0.2            # Quality consistency loss weight
+    lambda_diversity: float = 0.05            # Branch diversity loss weight
+
+    # temporal encoder config
+    temporal_arch: str = "bigru"               # "bigru" | "transformer"
+    temporal_num_layers: int = 2
+    temporal_num_heads: int = 4                # for transformer
+
+    # cross-modal attention config
+    cross_modal_num_heads: int = 4
+    cross_modal_dropout: float = 0.1
 
     # train
     batch_size: int = 8
@@ -50,6 +76,9 @@ class Config:
     same_category_pair: bool = True
     threshold: float = 0.5
     val_ratio: float = 0.2
+
+    # experiment config
+    experiment_name: str = "full"               # baseline | quality_head | consistency | temporal | cross_modal | science_feat | full
 
 
 CFG = Config()

@@ -19,12 +19,18 @@ def build_sample(
     audio_feat: torch.Tensor,
     meta_feat: np.ndarray,
     aes_feat: torch.Tensor | np.ndarray | None = None,
+    sci_hand_feat: torch.Tensor | np.ndarray | None = None,
+    frame_features: torch.Tensor | np.ndarray | None = None,
+    engagement_target: float | None = None,
 ) -> Dict:
     text_np = _as_float32_numpy(text_feat)
     video_np = _as_float32_numpy(video_feat)
     audio_np = _as_float32_numpy(audio_feat)
     meta_np = _as_float32_numpy(meta_feat)
     aes_np = _as_float32_numpy(aes_feat) if aes_feat is not None else np.zeros(7, dtype=np.float32)
+    sci_np = _as_float32_numpy(sci_hand_feat) if sci_hand_feat is not None else np.zeros(5, dtype=np.float32)
+    frame_np = _as_float32_numpy(frame_features) if frame_features is not None else np.zeros(0, dtype=np.float32)
+    eng_target = float(engagement_target) if engagement_target is not None else 0.0
 
     if text_np.shape[-1] != 768:
         raise RuntimeError(f"text feature dim must be 768, got {text_np.shape[-1]}")
@@ -44,4 +50,7 @@ def build_sample(
         "audio_feat": audio_np,
         "meta_feat": meta_np,
         "aes_feat": aes_np,
+        "sci_hand_feat": sci_np,
+        "frame_features": frame_np,
+        "engagement_target": eng_target,
     }
