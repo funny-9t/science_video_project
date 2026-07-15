@@ -22,6 +22,10 @@ def build_sample(
     sci_hand_feat: torch.Tensor | np.ndarray | None = None,
     frame_features: torch.Tensor | np.ndarray | None = None,
     engagement_target: float | None = None,
+    # ── 细粒度分支监督目标 (归一化到 [0,1]) ──
+    sci_target: float | None = None,
+    tech_target: float | None = None,
+    aes_target: float | None = None,
 ) -> Dict:
     text_np = _as_float32_numpy(text_feat)
     video_np = _as_float32_numpy(video_feat)
@@ -31,6 +35,9 @@ def build_sample(
     sci_np = _as_float32_numpy(sci_hand_feat) if sci_hand_feat is not None else np.zeros(5, dtype=np.float32)
     frame_np = _as_float32_numpy(frame_features) if frame_features is not None else np.zeros(0, dtype=np.float32)
     eng_target = float(engagement_target) if engagement_target is not None else 0.0
+    st = float(sci_target) if sci_target is not None else -1.0
+    tt = float(tech_target) if tech_target is not None else -1.0
+    at = float(aes_target) if aes_target is not None else -1.0
 
     if text_np.shape[-1] != 768:
         raise RuntimeError(f"text feature dim must be 768, got {text_np.shape[-1]}")
@@ -53,4 +60,8 @@ def build_sample(
         "sci_hand_feat": sci_np,
         "frame_features": frame_np,
         "engagement_target": eng_target,
+        # 细粒度分支监督目标 (-1 表示缺失)
+        "sci_target": st,
+        "tech_target": tt,
+        "aes_target": at,
     }

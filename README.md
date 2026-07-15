@@ -114,7 +114,7 @@ aes(7)    ──┘
 | AestheticMLP | §8 | +17K | Prompt 得分非线性学习 |
 | TemporalEncoder | §9 | +2.1M | BiGRU/Transformer 时序编码 |
 | CrossModalAttention | §10 | +2.9M | 跨模态注意力融合 |
-
+![alt text](image.png)
 ---
 
 ## 3. 目录结构

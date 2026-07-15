@@ -1,173 +1,619 @@
-你是一个专业的 AI 算法工程师，需要根据以下需求生成一个完整、可运行的 Python 项目代码。该项目用于训练和评估一个**面向科普短视频的多模态质量评价模型**。要求代码结构清晰、模块化，包含数据加载、模型定义、训练循环、评估指标和推理脚本。
+# Role
 
-### 一、项目背景与目标
+你是一位 CVPR / ACM MM / TMM 方向研究员，同时也是该项目的核心维护者。
 
-现有来自抖音的科普短视频数据集，包含：
-- **视频文件**（mp4）
-- **结构化标注文件**（Excel/CSV），包含 7 个细粒度质量指标（1~5 分）以及“是否上榜”的二分类标签，同时还包含博主粉丝数、点赞/评论/转发/收藏量等统计特征。
-- 部分样本只有“是否上榜”标签（粗粒度），部分样本同时有 7 个细粒度指标和上榜标签。
+请不要重写项目。
 
-**目标**：构建一个多模态无参考视频质量评估模型，能够：
-1. 对输入视频预测 7 个细粒度质量分数（科普信息量、科普通俗性、选题重要性、内容趣味性、低层视觉质量、听觉质量、视频美学质量）。
-2. 同时输出一个综合排序分数，用于判断视频是否能够“上榜”（二分类排序）。
-3. 利用 **pairwise ranking loss** 充分挖掘粗粒度数据中的相对顺序信息（上榜 > 未上榜），并结合细粒度数据的回归损失，实现多任务学习。
+请基于现有 science_video_project 代码库进行增量升级（Incremental Research Upgrade）。
 
-### 二、数据集说明（基于用户提供的 Excel 样例）
+目标：
 
-Excel 文件列名如下（示例数据已提供），你需要将其转换为 CSV 或直接在代码中读取 Excel：
+在保持现有训练流程、推理接口、Checkpoint兼容性、特征提取流水线不变的前提下，
 
-| 列名 | 含义 | 备注 |
-|------|------|------|
-| `链接` | 视频链接（或本地视频文件名） | 实际项目中应替换为本地视频路径 |
-| `是否上榜` | 是否上榜（是/否） | 二分类标签，用于构造 pair |
-| `科普信息量` | 1~5 分 | 细粒度标签，仅部分样本有值 |
-| `选题重要性` | 1~5 分 | 细粒度标签 |
-| `科普通俗性` | 1~5 分 | 细粒度标签 |
-| `内容趣味性` | 1~5 分 | 细粒度标签 |
-| `低层视觉质量` | 1~5 分 | 细粒度标签 |
-| `听觉质量` | 1~5 分 | 细粒度标签 |
-| `视频美学质量` | 1~5 分 | 细粒度标签 |
-| `粉丝量` | 整数 | 博主粉丝数，用于 Engagement 分支 |
-| `点赞量` | 整数 | 用于 Engagement 分支 |
-| `评论量` | 整数 | 用于 Engagement 分支 |
-| `转发量` | 整数 | 用于 Engagement 分支 |
-| `收藏量` | 整数 | 用于 Engagement 分支 |
+将当前 MVP 模型升级为：
 
-**数据规模**：
-- 细粒度样本：105 正（上榜） + 315 负（未上榜）（后续可扩至 315 + 945）
-- 粗粒度样本：365 正 + 1095 负（仅包含“是否上榜”标签）
+“面向科普短视频的多模态质量评估系统（Research Version）”。
 
-**视频文件存放路径**：假设为 `/data/videos/`，Excel 中的“链接”列包含文件名（如 `7640403274843065642.mp4`）。
+---
 
-### 三、模型架构要求
+# 一、现有项目现状
 
-参考 COVER 的多分支思想，设计如下架构（可适当简化）：
+当前系统：
 
-#### 输入模态：
-- 视频帧序列（从 mp4 均匀采样 8 帧）
-- 音频波形（采样率 16kHz，取 5 秒或完整长度）
-- 视频标题+字幕（从视频 OCR 提取，若无则用 Excel 中“内容（视频描述）”列代替）
-- 统计特征（粉丝量、点赞量、评论量、转发量、收藏量）
+MultiModalQualityModel
 
-#### 分支设计：
+包含：
 
-| 分支 | 输入 | 骨干网络 | 输出 |
-|------|------|----------|------|
-| Technical | 视频帧 | Swin-T (预训练) | 视觉质量分数 |
-| Aesthetic | 视频帧 | CLIP ViT-B/16 (冻结图像编码器) | 美学分数 |
-| Acoustics | 音频 Mel 谱 | Whisper tiny encoder (冻结) | 听觉质量分数 |
-| Scientific | 标题+字幕 | Chinese-RoBERTa-wwm-ext (微调) | 信息量、通俗性、重要性 三个分数 |
-| Engagement | 统计特征 | 2 层 MLP | 趣味性分数 |
+ScientificBranch
+TechnicalBranch
+AestheticBranch
 
-**注**：趣味性分数也作为细粒度标签的一个输出，与标注中的“内容趣味性”对齐。
+三分支结构。
 
-#### 综合排序头：
-所有分支输出的特征向量（非标量）先分别通过各自的回归头得到分数，然后将**所有特征向量拼接**，再经过一个 2 层 MLP 输出一个**综合排序得分**（标量）。
+训练目标：
 
-### 四、损失函数与训练策略
+Pairwise Ranking。
 
-#### 损失组成：
-1. **回归损失**（仅对细粒度样本计算）：  
-   对 7 个细粒度分数（信息量、通俗性、重要性、趣味性、视觉质量、听觉质量、美学质量）分别计算 MSE 或 L1Loss。  
-   `loss_reg = sum(MSE(pred_i, target_i))`
+输出：
 
-2. **Pairwise Ranking 损失**（对所有样本计算）：  
-   利用“是否上榜”标签构造正负对（上榜视频得分应高于未上榜视频）。  
-   采样策略：每个 batch 包含 B 个视频，从中动态组合所有可能的 (正, 负) 对，计算 margin ranking loss：  
-   `loss_rank = max(0, - (score_pos - score_neg) + margin)`  
-   margin 设为 0.1。
+overall_score
+probability
 
-3. **总损失**：  
-   `total_loss = loss_reg + lambda_rank * loss_rank`  
-   lambda_rank 可设为 0.5。
+---
 
-#### 优化器：
-- AdamW，学习率 1e-4（骨干网络冻结部分使用更低学习率或单独设置）
-- 采用余弦退火学习率调度
+# 二、现有架构问题
 
-#### 训练技巧：
-- 冻结预训练模型（CLIP、Whisper、Swin）的前几层，仅微调最后几层或回归头。
-- 视频帧数据增强：随机裁剪、水平翻转、色彩抖动。
-- 音频增强：添加高斯噪声、时间平移。
-- 处理不平衡数据：在构造 pair 时保证每个 batch 中正负样本数量接近。
+请不要删除现有模块。
 
-### 五、代码结构与文件清单
+但需要解决以下问题：
 
-需要生成以下文件（放置在项目根目录下）：
+## 问题1
 
-'''
-project/
-├── config/
-│ └── default.yaml # 配置文件（路径、超参数）
-├── data/
-│ ├── dataset.py # PyTorch Dataset 类，读取 Excel 和视频/音频/文本
-│ └── pair_sampler.py # 自定义采样器，动态生成正负对
-├── models/
-│ ├── backbone_tech.py # Swin Transformer 封装
-│ ├── backbone_aesthetic.py # CLIP 图像编码器
-│ ├── backbone_acoustic.py # Whisper 音频编码器
-│ ├── backbone_scientific.py # RoBERTa 文本编码器
-│ ├── backbone_engagement.py # 统计特征 MLP
-│ ├── multi_task_model.py # 完整模型，整合所有分支和排序头
-│ └── losses.py # 回归损失 + pairwise ranking loss
-├── train.py # 主训练脚本
-├── evaluate.py # 评估脚本（计算 PLCC、SROCC、AUC、HitRate）
-├── inference.py # 对单个视频进行推理，输出 7 维分数和上榜概率
-├── utils/
-│ ├── video_processing.py # 帧采样、音频提取
-│ ├── text_processing.py # 标题+字幕处理
-│ └── metrics.py # 评估指标计算
-└── requirements.txt # 依赖列表
-'''
+当前模型学习的是：
 
+```text
+是否上榜
+```
 
-### 六、需要实现的细节
+而不是：
 
-#### 1. 数据加载
-- 读取 Excel 文件（pandas）。
-- 根据“链接”列构造视频文件路径。
-- 对于每个视频：
-  - 使用 `decord` 或 `cv2` 均匀采样 N=8 帧，resize 到 224x224。
-  - 使用 `torchaudio` 加载音频，重采样到 16kHz，转换为 Mel 谱（80 bins，时间维度固定到 5 秒，若不足则补零）。
-  - 文本字段：将“内容（视频描述）”作为字幕，如果有标题则拼接标题。
-  - 统计特征：取粉丝量、点赞量、评论量、转发量、收藏量，进行归一化（使用全局统计量）。
-- 返回一个字典：`{'frames': tensor, 'audio_mel': tensor, 'text': str, 'stats': tensor, 'fine_labels': tensor (7,) or None, 'is_ranked': int (0/1)}`
+```text
+视频质量
+```
 
-#### 2. 模型实现
-- `MultiTaskModel` 类接收配置，初始化各分支。
-- 前向传播：
-  - 通过技术分支得到视觉质量分数（标量）和特征向量（如 Swin 的 cls token）。
-  - 通过美学分支得到美学分数（标量）和特征向量（CLIP 的 cls token）。
-  - 通过声学分支持听觉质量分数（标量）和特征向量（Whisper encoder 的均值池化）。
-  - 通过科学分支得到三个分数（信息量、通俗性、重要性）和特征向量（RoBERTa 的 cls）。
-  - 通过参与分支得到趣味性分数（标量）和特征向量（MLP 中间层）。
-  - 将所有分支的特征向量拼接，输入排序头得到综合得分。
-  - 返回：`{'scores_7dim': tensor (7,), 'rank_score': scalar, 'features': tensor}`
+即：
 
-#### 3. 训练循环
-- 每个 epoch：遍历 dataloader，对每个 batch 调用模型。
-- 对细粒度样本计算回归损失（MSE）。
-- 利用当前 batch 内的“是否上榜”标签构造所有正负对（上榜 vs 未上榜），计算 ranking loss（需要使用 batch 内的 rank_score）。
-- 反向传播，更新参数。
-- 记录训练损失，每 100 步打印。
+overall_score
 
-#### 4. 评估指标
-- **回归任务**（细粒度测试集）：PLCC, SROCC, RMSE（针对每个维度）
-- **排序任务**（所有测试集）：AUC, Hit Rate@K (K=10, 20), NDCG@K
-- 同时计算综合得分与“是否上榜”的 Spearman 相关系数。
+缺乏明确质量语义。
 
-### 七、额外要求
+---
 
-- 代码必须包含详细的注释，说明每个模块的作用。
-- 支持 GPU 训练，自动检测 `cuda`。
-- 提供 `requirements.txt`，包含 `torch, torchvision, torchaudio, transformers, openai-whisper, decord, opencv-python, pandas, numpy, scikit-learn, pyyaml, librosa`。
-- 提供 `config/default.yaml` 示例，允许用户修改数据路径、批大小、学习率等。
-- 训练完成后保存最佳模型 checkpoint（根据验证集的 AUC 或 SROCC 选择）。
-- 推理脚本 `inference.py` 接受一个视频路径，输出 7 个分数和上榜概率（综合得分经过 sigmoid）。
+## 问题2
 
-### 八、参考文件
+Scientific Score
 
-- 原 COVER 代码结构：https://github.com/taco-group/COVER
-- 用户提供的 Excel 数据样例（见对话中表格）
+Technical Score
 
-请生成完整的代码，确保可以直接运行（假设数据按描述放置）。
+Aesthetic Score
+
+仅作为辅助分支。
+
+没有形成显式质量空间。
+
+---
+
+## 问题3
+
+Gate只能学习：
+
+哪个分支更重要
+
+但无法学习：
+
+质量维度之间的关系。
+
+---
+
+## 问题4
+
+Pairwise Ranking
+
+只能学习：
+
+正样本 > 负样本
+
+无法学习：
+
+为什么更好。
+
+---
+
+# 三、升级目标
+
+保留：
+
+ScientificBranch
+
+TechnicalBranch
+
+AestheticBranch
+
+同时新增：
+
+Quality Space Layer
+
+---
+
+# 四、质量空间设计
+
+新增：
+
+```python
+quality_scores = [
+scientific_score,
+technical_score,
+aesthetic_score
+]
+```
+
+shape:
+
+```python
+(B,3)
+```
+
+---
+
+新增：
+
+QualityHead
+
+结构：
+
+```python
+MLP(
+3 → 32 → 16 → 1
+)
+```
+
+输出：
+
+```python
+quality_score
+```
+
+意义：
+
+学习：
+
+```text
+质量维度组合规律
+```
+
+而不是固定平均。
+
+---
+
+# 五、Consistency Learning
+
+新增：
+
+Consistency Loss
+
+约束：
+
+```python
+quality_score
+≈
+overall_score
+```
+
+公式：
+
+```python
+L_cons =
+MSE(
+quality_score,
+overall_score
+)
+```
+
+作用：
+
+让排序结果具有质量解释。
+
+---
+
+# 六、Metadata升级
+
+当前：
+
+meta_feat
+
+只有：
+
+- 时长
+- 标签数
+- 标题长度
+- 发布时间编码
+
+等基础特征。
+
+---
+
+新增：
+
+统计传播特征：
+
+```python
+log(fans+1)
+log(likes+1)
+log(comments+1)
+log(shares+1)
+log(favorites+1)
+```
+
+---
+
+新增：
+
+EngagementBranch
+
+结构：
+
+```python
+meta_feat
+↓
+MLP
+↓
+engagement_score
+```
+
+输出：
+
+```python
+engagement_score
+```
+
+---
+
+注意：
+
+engagement_score
+
+不得直接参与最终分类。
+
+只能：
+
+作为辅助任务。
+
+避免标签泄露。
+
+---
+
+# 七、Scientific Branch升级
+
+当前：
+
+text_feat
+
+来自：
+
+RoBERTa CLS
+
+---
+
+新增：
+
+Handcrafted Scientific Features
+
+例如：
+
+```python
+term_density
+
+entity_count
+
+number_density
+
+avg_sentence_length
+
+keyword_coverage
+```
+
+---
+
+与：
+
+RoBERTa embedding
+
+拼接：
+
+```python
+text_feature =
+concat(
+bert_feat,
+science_features
+)
+```
+
+---
+
+重新训练：
+
+ScientificBranch
+
+---
+
+# 八、Aesthetic Branch升级
+
+当前：
+
+CLIP Prompt Scorer
+
+输出：
+
+7维美学特征
+
+---
+
+保留。
+
+新增：
+
+Aesthetic MLP
+
+学习：
+
+```python
+aes_feature
+↓
+MLP
+↓
+aesthetic_score
+```
+
+而非直接使用Prompt得分。
+
+---
+
+# 九、Temporal Modeling
+
+当前：
+
+video_feat
+
+来自：
+
+CLIP逐帧均值
+
+即：
+
+```python
+mean(frame_features)
+```
+
+---
+
+升级：
+
+增加：
+
+TemporalEncoder
+
+可选：
+
+```python
+TransformerEncoder
+```
+
+或：
+
+```python
+BiGRU
+```
+
+结构：
+
+```python
+frame_features
+
+↓
+
+TemporalEncoder
+
+↓
+
+video_feature
+```
+
+---
+
+保留原有实现。
+
+通过配置控制：
+
+```yaml
+use_temporal_encoder: true
+```
+
+---
+
+# 十、Cross-Modal Fusion升级
+
+当前：
+
+Gate
+
+只对：
+
+三个分支隐向量
+
+进行加权。
+
+---
+
+升级：
+
+新增：
+
+CrossModalAttention
+
+结构：
+
+```python
+text_feature
+
+video_feature
+
+audio_feature
+
+↓
+
+MultiHeadAttention
+
+↓
+
+fusion_feature
+```
+
+---
+
+保留Gate。
+
+形成：
+
+```text
+CrossModalAttention
+
+↓
+
+Gate Fusion
+
+↓
+
+Overall Head
+```
+
+---
+
+# 十一、训练目标升级
+
+保留：
+
+Pairwise Ranking Loss
+
+---
+
+新增：
+
+Quality Consistency Loss
+
+```python
+L_cons
+```
+
+---
+
+新增：
+
+Branch Diversity Loss
+
+避免：
+
+三个分支学到相同内容。
+
+例如：
+
+```python
+cosine_similarity(
+sci_h,
+tech_h
+)
+```
+
+最小化。
+
+---
+
+总损失：
+
+```python
+Loss =
+L_rank
++
+0.2 * L_cons
++
+0.05 * L_div
+```
+
+---
+
+# 十二、解释性增强
+
+训练结束后输出：
+
+```python
+{
+    scientific_score,
+    technical_score,
+    aesthetic_score,
+    engagement_score,
+    quality_score,
+    overall_score,
+    gate_weights
+}
+```
+
+推理接口同步升级。
+
+---
+
+# 十三、实验系统
+
+自动生成：
+
+Exp1 Baseline
+
+Exp2 + QualityHead
+
+Exp3 + Consistency Loss
+
+Exp4 + Temporal Encoder
+
+Exp5 + CrossModalAttention
+
+Exp6 + Scientific Features
+
+Exp7 Full Model
+
+---
+
+# 十四、代码要求
+
+不要删除现有模块。
+
+不要修改已有API。
+
+不要破坏Checkpoint兼容性。
+
+采用：
+
+Backward Compatible Design。
+
+新增模块必须：
+
+- 独立文件
+- 配置驱动
+- 可开关
+
+例如：
+
+```yaml
+use_quality_head: true
+
+use_temporal_encoder: true
+
+use_cross_modal_attention: true
+
+use_science_features: true
+```
+
+---
+
+# 最终目标
+
+将当前 science_video_project
+
+从：
+
+Pairwise Ranking MVP
+
+升级为：
+
+具备论文创新点的
+
+Multi-dimensional Quality Assessment Framework
+
+并保持现有代码库可继续训练与部署。

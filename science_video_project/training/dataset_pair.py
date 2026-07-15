@@ -11,9 +11,10 @@ from pipeline.utils_io import load_pt
 
 
 class PairwiseVideoDataset(Dataset):
-    def __init__(self, samples: List[Dict], same_category: bool = True):
+    def __init__(self, samples: List[Dict], same_category: bool = True, pos_aug_noise: float = 0.05):
         self.samples = samples
         self.same_category = same_category
+        self.pos_aug_noise = pos_aug_noise  # 正样本特征增强噪声标准差
 
         self.pos = [s for s in samples if int(s["label"]) == 1]
         self.neg = [s for s in samples if int(s["label"]) == 0]
@@ -29,7 +30,9 @@ class PairwiseVideoDataset(Dataset):
             self.cat_map[cat][key].append(s)
 
         self.valid_cats = [c for c, v in self.cat_map.items() if v["pos"] and v["neg"]]
-        self.length = max(len(self.pos), len(self.neg))
+        # ── 正样本过采样：确保每个 epoch 正样本被充分采样 ──
+        self.pos_oversample = max(1, len(self.neg) // max(len(self.pos), 1))
+        self.length = max(len(self.pos) * self.pos_oversample, len(self.neg))
 
     @classmethod
     def from_metadata(
@@ -37,6 +40,7 @@ class PairwiseVideoDataset(Dataset):
         metadata_df: pd.DataFrame,
         feature_dir: str | Path,
         same_category: bool = True,
+        pos_aug_noise: float = 0.05,
     ) -> "PairwiseVideoDataset":
         feature_dir = Path(feature_dir)
         samples = []
@@ -48,8 +52,12 @@ class PairwiseVideoDataset(Dataset):
             sample = load_pt(pt_path)
             sample["label"] = int(row["label"])
             sample["category"] = str(row["category"])
+            # ── 细粒度分支监督目标 (从 CSV 列读取，缺失时 -1) ──
+            for key in ["sci_target", "tech_target", "aes_target"]:
+                val = row.get(key, -1)
+                sample[key] = float(val) if val is not None and not (isinstance(val, float) and np.isnan(val)) else -1.0
             samples.append(sample)
-        return cls(samples, same_category=same_category)
+        return cls(samples, same_category=same_category, pos_aug_noise=pos_aug_noise)
 
     def __len__(self) -> int:
         return self.length
@@ -60,6 +68,7 @@ class PairwiseVideoDataset(Dataset):
             pos = random.choice(self.cat_map[cat]["pos"])
             neg = random.choice(self.cat_map[cat]["neg"])
             return pos, neg
+        # ── 正样本过采样：随机重复选择正样本 ──
         return random.choice(self.pos), random.choice(self.neg)
 
     @staticmethod
@@ -73,6 +82,10 @@ class PairwiseVideoDataset(Dataset):
             "sci_hand_feat": torch.tensor(sample.get("sci_hand_feat", np.zeros(5, dtype=np.float32)), dtype=torch.float32),
             "frame_features": torch.tensor(sample.get("frame_features", np.zeros((0, 512), dtype=np.float32)), dtype=torch.float32),
             "engagement_target": torch.tensor([sample.get("engagement_target", 0.0)], dtype=torch.float32),
+            # ── 细粒度分支监督目标 ──
+            "sci_target": torch.tensor([sample.get("sci_target", -1.0)], dtype=torch.float32),
+            "tech_target": torch.tensor([sample.get("tech_target", -1.0)], dtype=torch.float32),
+            "aes_target": torch.tensor([sample.get("aes_target", -1.0)], dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:

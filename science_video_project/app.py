@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline.config import CFG
+from pipeline.step_aesthetic_clip import CLIPAestheticScorer, DEFAULT_PROMPTS
 from pipeline.step_audio import AudioEncoder
 from pipeline.step_extract import VideoExtractor
 from pipeline.step_meta import MetaFeatureBuilder
@@ -53,6 +54,32 @@ _video_encoder = None
 _meta_builder = None
 _sci_extractor = None  # §7 新增
 _aes_scorer = None     # §8 新增 (用于 app 推理时提取 aes_feat)
+
+
+def _extract_per_frame_features(video_encoder: VideoEncoder, frame_dir: str | Path) -> torch.Tensor:
+    """提取逐帧 CLIP 特征 (不池化)。仅研究版推理使用。"""
+    from PIL import Image
+
+    frame_paths = sorted(Path(frame_dir).glob("*.jpg"))
+    if not frame_paths:
+        return torch.zeros(0, 512, dtype=torch.float32)
+
+    feats = []
+    with torch.no_grad():
+        for p in frame_paths:
+            img = Image.open(p).convert("RGB")
+            if video_encoder.backend == "hf":
+                inputs = video_encoder.processor(images=img, return_tensors="pt")
+                pixel = inputs["pixel_values"].to(video_encoder.device, dtype=video_encoder.model.dtype)
+                out = video_encoder.model(pixel_values=pixel)
+                feat = out.image_embeds
+            else:
+                image = video_encoder.preprocess(img).unsqueeze(0).to(video_encoder.device)
+                feat = video_encoder.model.encode_image(image)
+            feat = feat / feat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            feats.append(feat.squeeze(0).detach().cpu())
+
+    return torch.stack(feats, dim=0).float()
 
 
 def init_models():
@@ -127,6 +154,9 @@ def init_models():
 
         # §7 科学性特征提取器
         _sci_extractor = ScienceFeatureExtractor()
+        # §8 美学打分器（仅研究版需要）
+        if _USE_RESEARCH:
+            _aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
 
         print("✓ All models initialized successfully")
         return True
@@ -243,6 +273,17 @@ def api_infer():
                         " ".join([str(data.get('title', '')), str(data.get('tags', '')), str(text_result.subtitle)])
                     ).numpy()
 
+                # §8 美学特征 (CLIP prompt scoring)
+                if _USE_RESEARCH and _aes_scorer is not None:
+                    aes_result = _aes_scorer.score_frames_batched(frame_path)
+                    dim_names = list(aes_result["dimensions"].keys())
+                    aes_feat_np = np.array([aes_result["dimensions"][n] for n in dim_names], dtype=np.float32)
+
+                # §9 时序帧特征 (仅研究版)
+                if _USE_RESEARCH and CFG.use_temporal_encoder:
+                    frame_feats = _extract_per_frame_features(_video_encoder, frame_path)
+                    frame_feats_np = frame_feats.numpy()
+
                 feature_source = "real"
                 print(f"  [upload] ✓ Features extracted from {video_path.name}")
             except Exception as ext_e:
@@ -265,6 +306,8 @@ def api_infer():
         if _USE_RESEARCH:
             model_kwargs["aes_feat"] = torch.tensor(aes_feat_np, dtype=torch.float32).unsqueeze(0).to(_device)
             model_kwargs["sci_hand_feat"] = torch.tensor(sci_hand_np, dtype=torch.float32).unsqueeze(0).to(_device)
+            if frame_feats_np.size > 0:
+                model_kwargs["frame_features"] = torch.tensor(frame_feats_np, dtype=torch.float32).unsqueeze(0).to(_device)
 
         with torch.no_grad():
             out = _model(**model_kwargs)

@@ -60,17 +60,22 @@ def main() -> None:
         if CFG.ffmpeg_path:
             os.environ["FFMPEG_PATH"] = str(CFG.ffmpeg_path)
 
-        asr_path = Path(CFG.asr_model_path).resolve()
-        audio_path = Path(CFG.audio_model_path).resolve()
-        if not asr_path.exists():
-            raise FileNotFoundError(f"ASR model path not found: {asr_path}")
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio model path not found: {audio_path}")
+        asr_path = CFG.asr_model_path  # 可能是模型名如 "tiny" 或本地路径
+        audio_path = CFG.audio_model_path
+        # 仅本地路径才需要 exists 检查，模型名由 faster-whisper 自动下载
+        asr_path_obj = Path(asr_path)
+        if asr_path_obj.exists() or not asr_path_obj.is_absolute():
+            pass  # 模型名或存在的本地路径，OK
+        else:
+            raise FileNotFoundError(f"ASR model path not found: {asr_path_obj}")
+        audio_path_obj = Path(audio_path)
+        if not audio_path_obj.exists() and audio_path_obj.is_absolute():
+            raise FileNotFoundError(f"Audio model path not found: {audio_path_obj}")
 
         extractor = VideoExtractor(audio_sr=CFG.audio_sr)
-        text_encoder = TextEncoder(CFG.text_model_name, str(asr_path), CFG.device, CFG.local_files_only)
+        text_encoder = TextEncoder(CFG.text_model_name, asr_path, CFG.device, CFG.local_files_only)
         video_encoder = VideoEncoder(CFG.clip_model_name, CFG.device)
-        audio_encoder = AudioEncoder(str(audio_path), CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
+        audio_encoder = AudioEncoder(audio_path, CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
         aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
 
         processed = 0
@@ -80,7 +85,7 @@ def main() -> None:
             video_id = get_video_id(video_path)
             if video_id not in row_map:
                 skipped += 1
-                logger.warning("Skip %s: not found in parsed_metadata.csv", video_id)
+                logger.warning("Skip %s: not found in metadata", video_id)
                 continue
 
             out_pt = CFG.feature_dir / f"{video_id}.pt"
@@ -94,8 +99,10 @@ def main() -> None:
             frame_path = CFG.frame_dir / video_id
             ensure_dir(frame_path)
 
-            extractor.extract_audio(video_path, wav_path)
-            extractor.extract_frames(video_path, frame_path, fps=CFG.frame_fps)
+            if not wav_path.exists():
+                extractor.extract_audio(video_path, wav_path)
+            if not frame_path.exists() or not any(frame_path.iterdir()):
+                extractor.extract_frames(video_path, frame_path, fps=CFG.frame_fps)
 
             text_result = text_encoder.encode_fields(
                 wav_path=str(wav_path),
