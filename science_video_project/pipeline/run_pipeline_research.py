@@ -31,6 +31,7 @@ from pipeline.step_audio import AudioEncoder
 from pipeline.step_extract import VideoExtractor
 from pipeline.step_meta import MetaFeatureBuilder
 from pipeline.step_science_features import ScienceFeatureExtractor
+from pipeline.step_llm_knowledge import LLMKnowledgeExtractor, DummyLLMKnowledgeExtractor
 from pipeline.step_text import TextEncoder
 from pipeline.step_video import VideoEncoder
 from pipeline.utils_io import ensure_dir, get_video_id, list_videos, load_metadata, save_pt, set_seed
@@ -117,6 +118,21 @@ def main() -> None:
         meta_builder = MetaFeatureBuilder(categories=metadata["category"].tolist(), out_dim=CFG.meta_dim)
         sci_extractor = ScienceFeatureExtractor()  # §7 新增
 
+        # §7+ LLM 知识科学性特征提取器
+        api_key = CFG.llm_api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        if CFG.use_llm_knowledge and api_key:
+            llm_extractor = LLMKnowledgeExtractor(
+                api_key=api_key,
+                model=CFG.llm_model_name,
+                api_base=CFG.llm_api_base,
+                cache_dir=CFG.llm_cache_dir,
+                temperature=CFG.llm_temperature,
+            )
+        else:
+            llm_extractor = DummyLLMKnowledgeExtractor()
+            if CFG.use_llm_knowledge and not api_key:
+                logger.warning("LLM knowledge enabled but no API key — using DummyLLM fallback")
+
         if CFG.ffmpeg_path:
             os.environ["FFMPEG_PATH"] = str(CFG.ffmpeg_path)
 
@@ -176,6 +192,9 @@ def main() -> None:
             # §7 手工科学性特征
             sci_hand = sci_extractor.extract_vector(text_result.subtitle)
 
+            # §7+ LLM 知识科学性特征
+            llm_knowledge = llm_extractor.extract(text_result.subtitle, verbose=(processed == 0))
+
             # §9 逐帧特征 (用于时序编码器)
             frame_feats = extract_per_frame_features(video_encoder, frame_path)
 
@@ -192,6 +211,7 @@ def main() -> None:
                 meta_feat=meta_feat,
                 aes_feat=aes_feat,
                 sci_hand_feat=sci_hand,
+                llm_knowledge_feat=llm_knowledge,
                 frame_features=frame_feats,
                 engagement_target=eng_target,
             )

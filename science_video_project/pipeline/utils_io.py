@@ -1,6 +1,7 @@
 import json
 import random
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,7 +27,7 @@ def list_videos(video_dir: str | Path) -> List[Path]:
     exts = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm"}
     if not base.exists():
         return []
-    return sorted([p for p in base.iterdir() if p.is_file() and p.suffix.lower() in exts])
+    return sorted([p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in exts])
 
 
 def get_video_id(video_path: str | Path) -> str:
@@ -57,7 +58,26 @@ def load_metadata(csv_path: str | Path) -> pd.DataFrame:
     if "publish_time" not in df.columns:
         df["publish_time"] = ""
     df["publish_time"] = df["publish_time"].fillna("").astype(str)
-    return df
+
+    label_counts = df.groupby("video_id")["label"].nunique()
+    conflicting_ids = set(label_counts[label_counts > 1].index.astype(str))
+    if conflicting_ids:
+        warnings.warn(
+            f"Dropping {len(conflicting_ids)} video IDs with conflicting labels.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        df = df[~df["video_id"].isin(conflicting_ids)]
+
+    duplicate_count = int(df.duplicated("video_id", keep="last").sum())
+    if duplicate_count:
+        warnings.warn(
+            f"Deduplicating {duplicate_count} repeated metadata rows by video_id.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        df = df.drop_duplicates("video_id", keep="last")
+    return df.reset_index(drop=True)
 
 
 def save_pt(obj: Any, path: str | Path) -> None:

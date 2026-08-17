@@ -7,6 +7,11 @@ def pairwise_ranking_loss(pos_score: torch.Tensor, neg_score: torch.Tensor, marg
     return F.margin_ranking_loss(pos_score, neg_score, target, margin=margin)
 
 
+def ranknet_pairwise_loss(pos_score: torch.Tensor, neg_score: torch.Tensor) -> torch.Tensor:
+    """Smooth pairwise logistic loss: -log(sigmoid(pos - neg))."""
+    return F.softplus(-(pos_score - neg_score)).mean()
+
+
 def weighted_pairwise_ranking_loss(
     pos_score: torch.Tensor,
     neg_score: torch.Tensor,
@@ -22,7 +27,7 @@ def weighted_pairwise_ranking_loss(
     # 基础 loss
     base_loss = F.relu(margin - diff)
     # 正样本偏低时额外加权
-    pos_low_mask = (pos_score < 0.5).float()  # sigmoid < 0.5 → 偏向负类
+    pos_low_mask = (pos_score < 0.0).float()  # raw logit < 0 -> sigmoid < 0.5
     weighted = base_loss * (1.0 + pos_weight * pos_low_mask)
     return weighted.mean()
 

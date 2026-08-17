@@ -1,25 +1,25 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pipeline.build_sample import build_sample
 from pipeline.config import CFG
-from pipeline.step_aesthetic_clip import CLIPAestheticScorer, DEFAULT_PROMPTS
-from pipeline.step_audio import AudioEncoder
-from pipeline.step_extract import VideoExtractor
-from pipeline.step_meta import MetaFeatureBuilder
-from pipeline.step_text import TextEncoder
-from pipeline.step_video import VideoEncoder
-from pipeline.utils_io import ensure_dir, get_video_id, load_metadata, save_json
+from pipeline.utils_io import get_video_id
 from training.model_mvp import MultiModalQualityModel
-from training.utils_train import adapt_checkpoint_state_dict, get_device
+from training.utils_train import (
+    adapt_checkpoint_state_dict,
+    build_model_config_from_cfg,
+    get_device,
+    merge_checkpoint_model_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,32 +31,140 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> MultiModalQualityModel:
-    model = MultiModalQualityModel(
-        text_dim=CFG.text_dim,
-        video_dim=CFG.video_dim,
-        audio_dim=CFG.audio_dim,
-        meta_dim=CFG.meta_dim,
-        aes_dim=CFG.aes_dim,
-        hidden_dim=CFG.hidden_dim,
-    ).to(device)
+def _compute_speech_rhythm(segments: list, total_duration: float) -> np.ndarray:
+    if not segments or total_duration <= 0:
+        return np.zeros(6, dtype=np.float32)
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    else:
-        state_dict = ckpt
+    seg_wpms = []
+    total_speech_time = 0.0
+    total_pause_time = 0.0
+    for i, (start, end, text) in enumerate(segments):
+        seg_dur = end - start
+        if seg_dur <= 0:
+            continue
+        char_count = len(text.replace(" ", ""))
+        seg_wpms.append(char_count / (seg_dur / 60.0))
+        total_speech_time += seg_dur
+        if i > 0:
+            gap = start - segments[i - 1][1]
+            if gap > 0.5:
+                total_pause_time += gap
 
-    model.load_state_dict(adapt_checkpoint_state_dict(state_dict))
+    if not seg_wpms:
+        return np.zeros(6, dtype=np.float32)
+
+    seg_wpms = np.array(seg_wpms, dtype=np.float32)
+    return np.array(
+        [
+            float(np.mean(seg_wpms)),
+            float(np.std(seg_wpms)),
+            float(np.min(seg_wpms)),
+            float(np.max(seg_wpms)),
+            total_pause_time / total_duration,
+            total_speech_time / total_duration,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _validate_model_path(model_path: str, label: str) -> str:
+    path = Path(model_path)
+    if path.exists() or not path.is_absolute():
+        return model_path
+    raise FileNotFoundError(f"{label} model path not found: {path}")
+
+
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+) -> tuple[MultiModalQualityModel, float, dict[str, object]]:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model_config = merge_checkpoint_model_config(ckpt, build_model_config_from_cfg(CFG))
+    model = MultiModalQualityModel(**model_config).to(device)
+
+    state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+    adapted = adapt_checkpoint_state_dict(state_dict, model.state_dict())
+    missing_keys, unexpected_keys = model.load_state_dict(adapted, strict=False)
+    if unexpected_keys:
+        raise RuntimeError(f"Unexpected checkpoint keys: {unexpected_keys[:5]}")
+    if missing_keys:
+        missing_preview = ", ".join(missing_keys[:5])
+        print(f"[load_model] Missing keys initialized from model defaults: {missing_preview}")
+
     model.eval()
-    return model
+    threshold = float(ckpt.get("best_threshold", CFG.threshold)) if isinstance(ckpt, dict) else float(CFG.threshold)
+    runtime_config = {
+        "science_feature_mode": str(ckpt.get("science_feature_mode", "full_ifg")),
+        "llm_text_source": str(
+            ckpt.get(
+                "llm_text_source",
+                "reasoning_and_analysis" if CFG.llm_include_reasoning else "analysis",
+            )
+        ),
+        "use_audio_feature": bool(ckpt.get("use_audio_feature", True)),
+        "use_cover_features": bool(model_config.get("use_cover_features", False)),
+        "video_dim": int(model_config.get("video_dim", CFG.video_dim)),
+    } if isinstance(ckpt, dict) else {
+        "science_feature_mode": "full_ifg",
+        "llm_text_source": "reasoning_and_analysis" if CFG.llm_include_reasoning else "analysis",
+        "use_audio_feature": True,
+        "use_cover_features": False,
+        "video_dim": CFG.video_dim,
+    }
+    return model, threshold, runtime_config
+
+
+def apply_science_feature_mode(
+    inputs: dict[str, torch.Tensor],
+    mode: str,
+    use_audio_feature: bool = True,
+) -> dict[str, torch.Tensor]:
+    if mode in {"none", "scores"}:
+        inputs["llm_analysis_feat"] = torch.zeros_like(inputs["llm_analysis_feat"])
+    if mode in {"none", "analysis_concat"}:
+        inputs["llm_knowledge_feat"] = torch.zeros_like(inputs["llm_knowledge_feat"])
+    if mode != "full_ifg":
+        inputs["sci_hand_feat"] = torch.zeros_like(inputs["sci_hand_feat"])
+    if not use_audio_feature:
+        inputs["audio_feat"] = torch.zeros_like(inputs["audio_feat"])
+    return inputs
+
+
+def _build_llm_extractor():
+    from pipeline.step_llm_knowledge import DummyLLMKnowledgeExtractor, LLMKnowledgeExtractor
+
+    api_key = CFG.llm_api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+    if CFG.use_llm_knowledge and api_key:
+        return LLMKnowledgeExtractor(
+            api_key=api_key,
+            model=CFG.llm_model_name,
+            api_base=CFG.llm_api_base,
+            cache_dir=CFG.llm_cache_dir,
+            temperature=CFG.llm_temperature,
+        )
+    return DummyLLMKnowledgeExtractor()
 
 
 def main() -> None:
+    from pipeline.build_sample import build_sample
+    from pipeline.step_aesthetic_clip import CLIPAestheticScorer, DEFAULT_PROMPTS
+    from pipeline.step_audio import AudioEncoder
+    from pipeline.step_dnsmos import DNSMOSScorer
+    from pipeline.step_extract import VideoExtractor
+    from pipeline.step_meta import MetaFeatureBuilder
+    from pipeline.step_science_features import ScienceFeatureExtractor
+    from pipeline.step_speech_features import compute_speech_features, normalize_speech_features
+    from pipeline.step_text import TextEncoder
+    from pipeline.step_video import VideoEncoder
+    from pipeline.utils_io import ensure_dir, load_metadata, save_json
+
     args = parse_args()
     video_path = Path(args.video)
     if not video_path.exists():
         raise FileNotFoundError(f"video not found: {video_path}")
+
+    device = get_device(CFG.device)
+    model, threshold, runtime_config = load_model(args.checkpoint, device)
 
     ensure_dir(CFG.audio_dir)
     ensure_dir(CFG.frame_dir)
@@ -65,33 +173,39 @@ def main() -> None:
     metadata = load_metadata(args.metadata)
     categories = metadata["category"].tolist()
     row_df = metadata[metadata["video_id"].astype(str) == video_id]
-    if len(row_df) > 0:
-        row = row_df.iloc[0].to_dict()
-    else:
-        row = {
-            "video_id": video_id,
-            "label": 0,
-            "category": "unknown",
-            "title": "",
-            "tags": "",
-            "duration": 0,
-            "verified": 0,
-            "publish_time": "",
-        }
+    row = row_df.iloc[0].to_dict() if len(row_df) > 0 else {
+        "video_id": video_id,
+        "label": 0,
+        "category": "unknown",
+        "title": "",
+        "tags": "",
+        "duration": 0,
+        "verified": 0,
+        "publish_time": "",
+    }
 
-    asr_path = Path(CFG.asr_model_path).resolve()
-    audio_path = Path(CFG.audio_model_path).resolve()
-    if not asr_path.exists():
-        raise FileNotFoundError(f"ASR model path not found: {asr_path}")
-    if not audio_path.exists():
-        raise FileNotFoundError(f"Audio model path not found: {audio_path}")
+    cover_feat = torch.zeros(CFG.cover_dim, dtype=torch.float32)
+    if runtime_config["use_cover_features"]:
+        from pipeline.step_cover import COVERFeatureExtractor
+
+        cover_extractor = COVERFeatureExtractor(CFG.cover_root, device=CFG.device)
+        cover_feat = cover_extractor.score(video_path)
+        del cover_extractor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    asr_path = _validate_model_path(CFG.asr_model_path, "ASR")
+    audio_path = _validate_model_path(CFG.audio_model_path, "Audio")
 
     extractor = VideoExtractor(audio_sr=CFG.audio_sr)
-    text_encoder = TextEncoder(CFG.text_model_name, str(asr_path), CFG.device, CFG.local_files_only)
+    text_encoder = TextEncoder(CFG.text_model_name, asr_path, CFG.device, CFG.local_files_only)
     video_encoder = VideoEncoder(CFG.clip_model_name, CFG.device)
-    audio_encoder = AudioEncoder(str(audio_path), CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
+    audio_encoder = AudioEncoder(audio_path, CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
     meta_builder = MetaFeatureBuilder(categories=categories + [row["category"]], out_dim=CFG.meta_dim)
     aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
+    dnsmos_scorer = DNSMOSScorer(device=CFG.device)
+    sci_hand_extractor = ScienceFeatureExtractor()
+    llm_extractor = _build_llm_extractor()
 
     wav_path = CFG.audio_dir / f"{video_id}.wav"
     frame_path = CFG.frame_dir / video_id
@@ -105,16 +219,49 @@ def main() -> None:
         title=str(row.get("title", "") or ""),
         tags=str(row.get("tags", "") or ""),
     )
-    video_feat = video_encoder.encode_frames(frame_path)
+    frame_features = video_encoder.encode_frame_features(
+        frame_path, max_frames=CFG.clip_max_frames
+    )
+    clip_video_feat = frame_features.mean(dim=0)
+    video_feat = (
+        clip_video_feat
+        if runtime_config["video_dim"] == CFG.clip_video_dim
+        else video_encoder.legacy_project(clip_video_feat, output_dim=runtime_config["video_dim"])
+    )
     audio_feat = audio_encoder.encode(str(wav_path))
     meta_feat = meta_builder.build(row)
 
-    # CLIP prompt-based aesthetic scoring → (D,)-dim feature vector
     aes_result = aes_scorer.score_frames_batched(frame_path)
-    dim_names = list(aes_result["dimensions"].keys())
     aes_feat = torch.tensor(
-        [aes_result["dimensions"][n] for n in dim_names],
+        [aes_result["dimensions"][n] for n in aes_result["dimensions"].keys()],
         dtype=torch.float32,
+    )
+    dnsmos_feat = dnsmos_scorer.score(str(wav_path))
+
+    subtitle_text = text_result.subtitle or ""
+    audio_duration = 0.0
+    try:
+        import soundfile as sf
+
+        audio_duration = sf.info(str(wav_path)).duration
+    except Exception:
+        pass
+    wpm_raw, speech_rhythm_raw_feat = compute_speech_features(text_result.segments, audio_duration)
+    wpm, speech_rhythm_feat = normalize_speech_features(wpm_raw, speech_rhythm_raw_feat)
+    sci_hand_feat = sci_hand_extractor.extract_vector(subtitle_text)
+    science_text = "\n".join(
+        part for part in [
+            str(row.get("title", "") or "").strip(),
+            str(row.get("tags", "") or "").strip(),
+            subtitle_text,
+        ] if part
+    )
+    llm_details = llm_extractor.extract_details(science_text, verbose=False)
+    llm_knowledge_feat = llm_details.scores
+    llm_analysis_feat = text_encoder.text_embedding(
+        llm_details.feature_text(
+            include_reasoning=runtime_config["llm_text_source"] == "reasoning_and_analysis"
+        )
     )
 
     sample = build_sample(
@@ -123,20 +270,44 @@ def main() -> None:
         label=int(row.get("label", 0)),
         text_feat=text_result.embedding,
         video_feat=video_feat,
+        clip_video_feat=clip_video_feat,
         audio_feat=audio_feat,
         meta_feat=meta_feat,
         aes_feat=aes_feat,
+        dnsmos_feat=dnsmos_feat,
+        wpm=wpm,
+        wpm_raw=wpm_raw,
+        speech_rhythm_feat=speech_rhythm_feat,
+        speech_rhythm_raw_feat=speech_rhythm_raw_feat,
+        sci_hand_feat=sci_hand_feat,
+        llm_knowledge_feat=llm_knowledge_feat,
+        llm_analysis_feat=llm_analysis_feat,
+        cover_feat=cover_feat,
+        frame_features=frame_features,
     )
 
-    device = get_device(CFG.device)
-    model = load_model(args.checkpoint, device)
     inputs = {
-        "text_feat": torch.tensor(sample["text_feat"], dtype=torch.float32).unsqueeze(0).to(device),
-        "video_feat": torch.tensor(sample["video_feat"], dtype=torch.float32).unsqueeze(0).to(device),
-        "audio_feat": torch.tensor(sample["audio_feat"], dtype=torch.float32).unsqueeze(0).to(device),
-        "meta_feat": torch.tensor(sample["meta_feat"], dtype=torch.float32).unsqueeze(0).to(device),
-        "aes_feat": torch.tensor(sample["aes_feat"], dtype=torch.float32).unsqueeze(0).to(device),
+        key: torch.tensor(sample[key], dtype=torch.float32).unsqueeze(0).to(device)
+        for key in [
+            "text_feat",
+            "video_feat",
+            "audio_feat",
+            "meta_feat",
+            "aes_feat",
+            "dnsmos_feat",
+            "speech_rhythm_feat",
+            "sci_hand_feat",
+            "llm_knowledge_feat",
+            "llm_analysis_feat",
+            "cover_feat",
+        ]
     }
+    inputs["wpm"] = torch.tensor([sample["wpm"]], dtype=torch.float32).unsqueeze(0).to(device)
+    inputs = apply_science_feature_mode(
+        inputs,
+        str(runtime_config["science_feature_mode"]),
+        bool(runtime_config["use_audio_feature"]),
+    )
 
     with torch.no_grad():
         out = model(**inputs)
@@ -148,7 +319,8 @@ def main() -> None:
         "aesthetic_score": float(out["aesthetic_score"].item()),
         "overall_score": float(out["overall_score"].item()),
         "probability": probability,
-        "prediction": "上榜" if probability >= CFG.threshold else "未上榜",
+        "threshold": threshold,
+        "prediction": "top" if probability >= threshold else "not_top",
     }
 
     print(json.dumps(result, ensure_ascii=False, indent=2))

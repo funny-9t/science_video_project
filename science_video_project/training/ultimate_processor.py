@@ -88,7 +88,7 @@ if __name__ == "__main__":
     evaluator = ScienceVideoContinuousEvaluator(
         feat_path=r"D:\Projects\SciBert\chinese-robeta-wwm-ext",
         ner_path=r"D:\Projects\SciBert\roberta-base-finetuned-cluener2020-chinese",
-        sci_dict_path="sci_whitelist.txt"
+        sci_dict_path=r"D:\Projects\SciBert\sci_whitelist.txt"
     )
     
     # 定义存放 txt 字幕的文件夹

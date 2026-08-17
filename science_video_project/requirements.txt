@@ -1,4 +1,5 @@
 torch
+torchvision
 transformers
 safetensors
 faster-whisper
@@ -7,6 +8,15 @@ openai-clip
 opencv-python
 pillow
 numpy
+onnxruntime
+openai
 pandas
 scikit-learn
+scipy
+speechmos
+soundfile
 tqdm
+pyyaml
+decord
+timm
+einops

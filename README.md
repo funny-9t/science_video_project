@@ -1,621 +1,490 @@
-# 面向科普短视频的多维质量评估系统
+# 面向科普短视频的多模态质量评估系统
 
-> **Multi-dimensional Quality Assessment Framework for Science Short Videos**
+本项目是一个面向毕业设计的科普短视频质量评估原型系统。系统以视频、音频、文本和元数据为输入，通过多模态特征提取与弱监督 pairwise ranking 训练，输出科普短视频的多维质量分数和上榜概率。
 
-基于多模态特征融合与弱监督排序学习，构建科普类短视频无参考质量评估系统。支持 **MVP 版**（Pairwise Ranking）和 **研究版**（多维质量空间建模）两种模式。
+当前主线代码位于 `science_video_project/`，核心模型是 `MultiModalQualityModel`。项目同时保留了研究版扩展模块，放在 `science_video_project/training/research/`。
 
----
+## 1. 项目目标
 
-## 目录
+短视频平台通常只有“上榜/未上榜”等弱标签，而没有人工 MOS 绝对质量分数。本项目将任务建模为无参考视频质量评估与成对排序学习：
 
-- [1. 项目概览](#1-项目概览)
-- [2. 模型架构](#2-模型架构)
-- [3. 目录结构](#3-目录结构)
-- [4. 快速开始](#4-快速开始)
-- [5. 特征提取流水线](#5-特征提取流水线)
-- [6. 训练](#6-训练)
-- [7. 推理](#7-推理)
-- [8. Web 服务](#8-web-服务)
-- [9. 研究版升级](#9-研究版升级)
-- [10. 消融实验](#10-消融实验)
-- [11. 配置说明](#11-配置说明)
-- [12. 常见问题](#12-常见问题)
+- 正样本：`label = 1`，代表上榜或高质量样本
+- 负样本：`label = 0`，代表未上榜或低质量样本
+- 训练约束：`score(pos) > score(neg)`
 
----
+模型输出包括：
 
-## 1. 项目概览
+- `scientific_score`：科学内容质量
+- `technical_score`：技术制作质量
+- `aesthetic_score`：视觉美学质量
+- `overall_score`：综合质量 logit
+- `probability`：上榜概率
+- `prediction`：根据阈值判断 `top` / `not_top`
 
-### 问题定义
+## 2. 当前代码概览
 
-无参考视频质量评估（NR-VQA）任务。给定科普短视频及其元数据，输出多维质量评分和"上榜/未上榜"预测。
+### 特征提取
 
-**输入**：$\mathbf{x} = \{\text{video}, \text{audio}, \text{text}, \text{meta}\}$
+`science_video_project/pipeline/` 负责把原始视频转换为 `.pt` 特征文件。
 
-**输出**：
-- `scientific_score` — 科学内容质量
-- `technical_score` — 技术制作质量
-- `aesthetic_score` — 视觉美学质量
-- `quality_score` — 学习到的质量空间得分（研究版）
-- `overall_score` — 综合评分
-- `probability` — 上榜概率
+主要特征包括：
 
-### 关键约束
+- 文本特征：Whisper ASR 字幕 + 标题 + 标签，经中文 RoBERTa 编码，维度 768
+- 视频特征：CLIP ViT-L/14 对全视频最多 40 帧做全局均匀采样；保存原生 768 维均值与逐帧序列，同时保留 512 维兼容特征用于旧 checkpoint
+- COVER 特征：冻结官方预训练模型，提取 semantic / technical / aesthetic 三个分支分数，维度 3
+- 音频特征：Whisper encoder 音频表示，维度 384
+- 元数据特征：时长、标题长度、标签数量、认证状态、发布时间、类别编码，维度 16
+- 美学特征：CLIP prompt 对比打分，维度 7
+- 客观音频质量：DNSMOS，维度 3
+- 语速节奏：WPM 与分段语速/停顿/语音密度特征，维度 1 + 6
+- 科学性手工特征：术语密度、实体比例、数字密度、平均句长、关键词覆盖率，维度 5
+- LLM 知识评分：事实一致性、逻辑连贯性、证据充分性、不确定性意识，维度 4
+- LLM 分析语义：DeepSeek V4-Pro 的结构化分析/推理文本经中文 RoBERTa 编码，维度 768
 
-| 约束 | 说明 |
-|------|------|
-| 无 MOS 绝对评分 | 仅有"上榜/未上榜"二值标签 |
-| 传播性指标隔离 | 点赞/评论/转发等不参与主干建模，避免信息泄露 |
-| Pairwise Ranking | $q(x_{pos}) > q(x_{neg})$ |
+### 模型结构
 
----
+`science_video_project/training/model_mvp.py` 中的 `MultiModalQualityModel` 采用三分支结构：
 
-## 2. 模型架构
+```text
+文本 + 元数据 + LLM评分 + LLM分析语义 + 科学性手工特征
+        -> ScientificBranch -> scientific_score
 
-### 2.1 MVP 版：`MultiModalQualityModel`
+视频 + 元数据 + DNSMOS + WPM + 语速节奏 + COVER技术/语义质量
+        -> TechnicalBranch  -> technical_score
 
-```
-输入特征                    三分支评分                     门控融合
-─────────────────────────────────────────────────────────────────
-text(768) ──┐           ┌─ ScientificBranch ─→ sci_score ─┐
-meta(16)  ──┘           │                                  │
-                        │                                  │
-video(512)──┐           ├─ TechnicalBranch  ─→ tech_score ─┼─→ Gate → Fusion → overall_score
-audio(384)──┼───────────┤                                  │              → probability
-meta(16)   ─┘           │                                  │
-                        │                                  │
-video(512)──┐           └─ AestheticBranch  ─→ aes_score  ─┘
-text(768) ──┼─ AestheticBranch
-audio(384)──┤
-aes(7)    ──┘
+视频 + 文本 + 音频 + CLIP美学特征 + COVER美学/语义质量
+        -> AestheticBranch  -> aesthetic_score
+
+ScientificBranch hidden 对技术/美学 hidden 做 Cross-Gating
+        -> 学习式融合或三个分支严格等权融合
+        -> overall_score / probability
 ```
 
-### 2.2 研究版：`ResearchModel`（新增模块以 ★ 标注）
+可选模块：
 
-```
-                          ┌─────────────────────────────────┐
-                          │       §10 CrossModalAttention ★  │
-                          │  MultiHeadAttention(text,video,  │
-                          │                    audio)        │
-                          └──────────┬──────────────────────┘
-                                     │
-         ┌───────────────────────────┼───────────────────────────┐
-         ▼                           ▼                           ▼
-┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│ ScientificBranch │      │ TechnicalBranch  │      │ AestheticBranch  │
-│ text(768+5★)+meta│      │ video+audio+meta │      │ video+text+audio │
-│ §7 手工科学特征 ★│      │                  │      │ +aes+§8 MLP ★    │
-│ sci_score        │      │ tech_score       │      │ aes_score        │
-└────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-         │                        │                        │
-         └────────────────────────┼────────────────────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │     §4 QualityHead ★       │
-                    │  MLP(sci,tech,aes)→quality │
-                    └─────────────┬─────────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │    Gate(Fusion) + Fusion   │
-                    └─────────────┬─────────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              ▼                   ▼                    ▼
-      overall_score         probability        §6 EngagementBranch ★
-                                                (辅助,不参与分类)
-```
+- `ScientificBranch`：支持直接拼接和 IFG（信息特征门控）两种知识融合方式
+- `pipeline/step_cover.py`：官方 COVER 权重的冻结适配器，按视频 ID 固定 Python / NumPy / Torch 采样随机数
+- `training/cross_gating.py`：科学性表示先门控技术/美学表示，再计算增强分支分数
+- `fusion_mode=average`：科学性分支直接贡献固定为 `1/3`，用于防止学习式门控把创新分支稀释
+- `training/research/`：研究版扩展，包括 cross-modal attention、temporal encoder、quality head、engagement branch 等
 
-**新增创新模块**（详见 [§9 研究版升级](#9-研究版升级)）：
+### 训练逻辑
 
-| 模块 | 章节 | 参数量 | 说明 |
-|------|------|--------|------|
-| QualityHead | §4 | +1.7K | MLP(3→32→16→1) 质量空间建模 |
-| EngagementBranch | §6 | +37K | 传播力辅助预测 |
-| ScienceFeatureProjection | §7 | +99K | BERT+手工科学性特征融合 |
-| AestheticMLP | §8 | +17K | Prompt 得分非线性学习 |
-| TemporalEncoder | §9 | +2.1M | BiGRU/Transformer 时序编码 |
-| CrossModalAttention | §10 | +2.9M | 跨模态注意力融合 |
-![alt text](image.png)
----
+`science_video_project/training/train.py` 使用 pairwise ranking：
+
+- 训练集随机采样正负样本对
+- 验证集使用固定正负样本对，保证指标可复现
+- 损失函数支持 RankNet、focal/weighted/margin ranking、点式 BCE 校准和细粒度分支监督
+- 可选 COVER 式两阶段训练：先独立预训练三个分支，再恢复 Cross-Gating 联合训练
+- 排序指标基于固定正负 pair；AUC、PR-AUC、F1 和阈值基于去重后的唯一视频
+- checkpoint 保存模型权重、最佳阈值和完整模型结构配置
+
+### 推理逻辑
+
+`science_video_project/inference/infer.py` 与 `full_infer.py` 已与训练特征保持一致。推理时会重新提取训练阶段使用的完整特征，并从 checkpoint 中读取：
+
+- 模型结构配置
+- `best_threshold`
+- `model_state_dict`
+
+这样可以避免训练和推理模型参数不一致、特征缺失或阈值漂移。
 
 ## 3. 目录结构
 
-```
+```text
 science_video_ranker_mvp/
-│
-├── README.md                          ← 本文件
-├── 1_QUICK_START.md                   ← 快速启动指南
-├── 2_README_FRONTEND.md               ← 前端说明
-├── 3_DEPLOYMENT_GUIDE.md              ← 部署指南
-├── 架构.md                            ← 架构文档
-├── start_service.bat / .sh            ← 一键启动脚本
-│
-├── chinese-robeta-wwm-ext/            ← 中文 RoBERTa 模型权重
-├── faster-whisper-large-v2/           ← Whisper ASR 模型权重
-├── openaiclip-vit-large-patch14/      ← CLIP 视觉模型权重
-│
-└── science_video_project/             ← 主项目目录
-    │
+├── README.md
+├── 1_QUICK_START.md
+├── 2_README_FRONTEND.md
+├── 3_DEPLOYMENT_GUIDE.md
+├── 架构.md
+├── prompt.md
+├── new_prompt.md
+├── chinese-robeta-wwm-ext/
+├── faster-whisper-large-v2/
+├── openaiclip-vit-large-patch14/
+└── science_video_project/
     ├── data/
-    │   ├── videos/                    ← 原始视频
-    │   ├── metadata.csv               ← 元数据标签
-    │   └── parse.py                   ← 元数据解析
-    │
+    │   ├── convert_annotations.py
+    │   ├── filter_metadata.py
+    │   ├── normalize_urls.py
+    │   └── resolve_short_links.py
+    ├── pipeline/
+    │   ├── config.py
+    │   ├── run_pipeline.py
+    │   ├── run_pipeline_research.py
+    │   ├── build_sample.py
+    │   ├── step_text.py
+    │   ├── step_video.py
+    │   ├── step_audio.py
+    │   ├── step_meta.py
+    │   ├── step_aesthetic_clip.py
+    │   ├── step_dnsmos.py
+    │   ├── step_science_features.py
+    │   └── step_llm_knowledge.py
+    ├── training/
+    │   ├── model_mvp.py
+    │   ├── train.py
+    │   ├── dataset_pair.py
+    │   ├── dataloader_pair.py
+    │   ├── losses.py
+    │   ├── metrics.py
+    │   ├── utils_train.py
+    │   ├── cross_gating.py
+    │   └── research/
+    ├── inference/
+    │   ├── infer.py
+    │   ├── full_infer.py
+    │   └── batch_infer.py
+    ├── frontend/
+    ├── tools/
     ├── outputs/
-    │   ├── frames/                    ← 抽帧输出
-    │   ├── audio/                     ← 音频提取
-    │   ├── features/                  ← 特征 .pt 文件
-    │   ├── checkpoints/               ← 模型检查点
-    │   └── logs/                      ← 训练/流水线日志
-    │
-    ├── pipeline/                      ← 特征提取流水线
-    │   ├── config.py                  ← 全局配置
-    │   ├── utils_io.py                ← IO 工具
-    │   ├── step_extract.py            ← ffmpeg/OpenCV 抽帧
-    │   ├── step_text.py               ← ASR + BERT 文本编码
-    │   ├── step_video.py              ← CLIP 视频编码
-    │   ├── step_audio.py              ← Whisper 音频编码
-    │   ├── step_meta.py               ← 元数据特征构建
-    │   ├── step_aesthetic_clip.py     ← CLIP Prompt 美学评分
-    │   ├── step_science_features.py   ← ★ 手工科学性特征
-    │   ├── build_sample.py            ← 特征组装
-    │   ├── run_pipeline.py            ← MVP 流水线入口
-    │   └── run_pipeline_research.py   ← ★ 研究版流水线入口
-    │
-    ├── training/                      ← 训练模块
-    │   ├── model_mvp.py               ← MVP 三分支模型
-    │   ├── model_research.py          ← ★ 研究版主模型
-    │   ├── quality_head.py            ← ★ 质量空间头
-    │   ├── cross_modal_attention.py   ← ★ 跨模态注意力
-    │   ├── engagement_branch.py       ← ★ 传播力分支
-    │   ├── step_temporal.py           ← ★ 时序编码器
-    │   ├── losses.py                  ← MVP 损失函数
-    │   ├── losses_research.py         ← ★ 研究版损失函数
-    │   ├── metrics.py                 ← 评估指标
-    │   ├── dataset_pair.py            ← Pairwise 数据集
-    │   ├── dataloader_pair.py         ← DataLoader 整理
-    │   ├── utils_train.py             ← 训练工具 + checkpoint 适配
-    │   ├── train.py                   ← MVP 训练入口
-    │   ├── train_research.py          ← ★ 研究版训练入口
-    │   └── experiments.py             ← ★ 消融实验系统
-    │
-    ├── inference/                     ← 推理模块
-    │   ├── infer.py                   ← 单视频推理
-    │   ├── full_infer.py              ← 完整推理引擎
-    │   └── batch_infer.py             ← 批量推理
-    │
-    ├── frontend/                      ← Web 前端
-    │   ├── index.html
-    │   └── static/
-    │
-    ├── tools/                         ← 诊断工具
-    ├── app.py                         ← Flask Web 服务
-    ├── requirements.txt               ← Python 依赖
-    └── README.md                      ← 子项目文档
+    ├── requirements.txt
+    └── README.md
 ```
 
----
+## 4. 环境准备
 
-## 4. 快速开始
-
-### 4.1 环境要求
+推荐环境：
 
 - Python 3.10+
-- CUDA 11.8+（可选，CPU 模式可用但较慢）
-- ffmpeg（用于音视频提取）
+- CUDA GPU，可选但推荐
+- ffmpeg
 
-### 4.2 安装依赖
+安装依赖：
 
 ```bash
 cd science_video_project
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 内容：
-```
-torch
-transformers
-safetensors
-faster-whisper
-openai-whisper
-openai-clip
-opencv-python
-pillow
-numpy
-pandas
-scikit-learn
-tqdm
-flask
-flask-cors
+Windows 下若要让 `faster-whisper` 使用 NVIDIA GPU，还需要与本机 CUDA 兼容的
+`nvidia-cublas-cu12` 和 `nvidia-cudnn-cu12`。没有 GPU 时会自动使用 CPU，结果一致但速度较慢。
+
+模型路径和数据路径集中在：
+
+```text
+science_video_project/pipeline/config.py
 ```
 
-### 4.3 准备数据
+重点检查：
 
-1. 将视频文件放入 `data/videos/`
-2. 编辑 `data/metadata.csv`，至少包含：
+```python
+video_dir = Path(r"F:\Data\172.16.29.65")
+metadata_csv = data_dir / "parsed_metadata_filtered.csv"
+text_model_name = r"D:\Projects\science_video_ranker_mvp\chinese-robeta-wwm-ext"
+clip_model_name = r"D:\Projects\science_video_ranker_mvp\openaiclip-vit-large-patch14"
+asr_model_path = str(project_root.parent / "faster-whisper-large-v2")
+ffmpeg_path = r"D:\Projects\ffmpeg-8.0.1-essentials_build\bin"
+```
+
+## 5. 数据格式
+
+元数据 CSV 至少需要包含：
 
 ```csv
 video_id,label,category,title,tags,duration
-demo_001,1,物理,量子纠缠科普,量子|物理|科普,120
-demo_002,0,生物,细胞分裂过程,细胞|生物|分裂,90
 ```
 
-- `video_id`：视频文件名（不含扩展名）
-- `label`：1=上榜，0=未上榜
-- **禁止**包含点赞/评论/转发等传播性字段
+推荐字段：
 
-### 4.4 配置模型路径
-
-编辑 `pipeline/config.py`，修改以下路径：
-
-```python
-text_model_name = r"<你的路径>/chinese-robeta-wwm-ext"
-clip_model_name = r"<你的路径>/openaiclip-vit-large-patch14"
-asr_model_path  = r"<你的路径>/faster-whisper-large-v2"
-ffmpeg_path     = r"<你的路径>/ffmpeg/bin"
+```csv
+video_id,label,category,title,tags,duration,verified,publish_time
 ```
 
----
+说明：
 
-## 5. 特征提取流水线
+- `video_id` 需要能和视频文件名匹配
+- `label` 为 `1` 或 `0`
+- `category` 用于同类别内正负配对
+- `title`、`tags` 会与 ASR 字幕拼接后进入文本编码器
+- 传播数据如点赞、评论、转发不进入主模型，避免标签泄漏
 
-### MVP 版流水线
+## 6. 特征提取
+
+进入子项目目录：
+
+```bash
+cd science_video_project
+```
+
+运行主线特征流水线：
 
 ```bash
 python pipeline/run_pipeline.py
 ```
 
-处理流程：
-```
-原始视频 → ffmpeg提取音频(16kHz) + OpenCV逐帧抽取(1fps)
-        → Whisper ASR转写字幕
-        → BERT 提取文本embedding (768维)
-        → CLIP 提取视频embedding (512维, 逐帧均值池化)
-        → Whisper Encoder 提取音频embedding (384维)
-        → MetaFeatureBuilder 构建元数据特征 (16维)
-        → CLIPAestheticScorer 美学评分 (7维)
-        → 组装保存为 outputs/features/{video_id}.pt
+输出位置：
+
+```text
+outputs/audio/{video_id}.wav
+outputs/frames/{video_id}/*.jpg
+outputs/features/{video_id}.pt
+outputs/logs/pipeline.log
 ```
 
-### 研究版流水线（扩展特征）
+如果需要研究版逐帧特征和传播辅助标签：
 
 ```bash
 python pipeline/run_pipeline_research.py
 ```
 
-在 MVP 基础上新增：
-- **手工科学性特征**（5维）：术语密度、实体数量、数字密度、平均句长、关键词覆盖率
-- **逐帧 CLIP 特征**（N×512）：供时序编码器使用
-- **传播力标签**：用于 EngagementBranch 辅助训练
-
----
-
-## 6. 训练
-
-### 6.1 MVP 训练
+对已有 `.pt` 样本补齐 Whisper encoder 音频表示、DNSMOS、WPM 和 speech rhythm：
 
 ```bash
+python tools/backfill_features.py --features audio,dnsmos,speech --force
+```
+
+`audio_feat` 直接复用 `outputs/audio` 中的 WAV，不会重新执行 ASR。编码器使用本地
+`faster-whisper-large-v2`，对每个视频均匀抽取最多 8 个 30 秒窗口，池化并归一化为 384 维向量。
+
+DeepSeek 科学性知识特征分为“API 预取”和“本地 RoBERTa 编码”两步，支持 JSONL 断点缓存：
+
+```powershell
+$env:DEEPSEEK_API_KEY="替换为新申请的 API Key"
+python tools/prefetch_llm_cache.py --workers 4
+python tools/backfill_features.py --features llm --llm-cache-only --force
+```
+
+最终每个样本会保存 4 维评分、仅分析文本的 768 维向量，以及“推理过程 + 分析文本”的
+768 维向量，便于做公平消融。API Key 仅通过环境变量传入，不要写入代码、配置或缓存。
+
+补齐原生 CLIP 全局稀疏帧序列与冻结 COVER 三分支特征：
+
+```powershell
+python tools/backfill_features.py --features clip --report outputs/logs/clip_backfill_report.json
+python tools/backfill_features.py --features cover --cover-root D:\Projects\COVER --report outputs/logs/cover_backfill_report.json
+python tools/check_features.py
+```
+
+COVER 使用 `D:\Projects\COVER\pretrained_weights\COVER.pth` 与官方 `val-ytugc`
+视图配置。技术分支采用空间 fragments，语义/美学分支采用全局稀疏采样；特征版本不匹配时
+`--use_cover_features` 会直接终止训练，避免旧随机结果或零向量混入实验。
+
+## 7. 模型训练
+
+主线 MVP 训练：
+
+```bash
+cd science_video_project
 python training/train.py
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--epochs` | 10 | 训练轮数 |
-| `--batch_size` | 8 | 批大小 |
-| `--lr` | 1e-3 | 学习率 |
-| `--margin` | 1.0 | Ranking margin |
-| `--same_category` | True | 同类别内配对 |
-
-**损失函数**：
-$$L = L_{rank} + 0.1 \cdot L_{reg}$$
-
-- $L_{rank}$：MarginRankingLoss，正样本得分 > 负样本得分
-- $L_{reg}$：MSE(overall_score, mean(sci, tech, aes))
-
-**评估指标**：ranking_accuracy、accuracy、F1、AUC
-
-### 6.2 研究版训练
+常用参数：
 
 ```bash
-# 全模块训练
-python training/train_research.py
-
-# 仅启用部分模块
-python training/train_research.py --quality_head 1 --consistency_loss 1 --cross_modal_attn 0
-
-# 从 MVP checkpoint 热启动
-python training/train_research.py --pretrained outputs/checkpoints/best.pt
-
-# 使用 MVP 原始损失（基线对比）
-python training/train_research.py --use_mvp_loss
+python training/train.py \
+  --metadata data/parsed_metadata_filtered.csv \
+  --feature_dir outputs/features \
+  --epochs 30 \
+  --batch_size 8 \
+  --lr 3e-4 \
+  --margin 0.3
 ```
 
-**总损失函数**：
-$$L_{total} = L_{rank} + 0.2 \cdot L_{cons} + 0.05 \cdot L_{div}$$
+科学性分支可通过以下参数切换：
 
-| 损失 | 公式 | 作用 |
-|------|------|------|
-| $L_{rank}$ | MarginRankingLoss | 成对排序 |
-| $L_{cons}$ | MSE(quality_score, overall_score) | 质量一致性 |
-| $L_{div}$ | mean(cos(sci_h, tech_h) + cos(sci_h, aes_h) + cos(tech_h, aes_h)) | 分支多样性 |
+```text
+--science_feature_mode none|scores|analysis_concat|analysis_scores_concat|analysis_scores_ifg|full_ifg
+--llm_text_source analysis|reasoning_and_analysis
+```
 
----
-
-## 7. 推理
-
-### 7.1 命令行推理
+运行完整科学性特征消融：
 
 ```bash
-# MVP 模型
+python tools/run_science_ablation.py
+```
+
+运行 COVER 结构、采样、融合、Cross-Gating、科学性特征与分阶段训练的受控消融：
+
+```bash
+python tools/run_cover_ablation.py --seeds 42 --epochs 15 --patience 5 --lr 1e-5
+```
+
+建议先用单 seed 筛选方案，再对候选方案执行 `--seeds 42,43,44`。报告会同时保存
+pairwise accuracy、唯一视频 AUC/PR-AUC、三个分支 SRCC 和科学性融合权重。
+
+当前固定划分下的最高分训练配置：
+
+```bash
+python training/train.py \
+  --epochs 15 \
+  --early_stop_patience 5 \
+  --lr 1e-5 \
+  --seed 42 \
+  --split_seed 42 \
+  --disable_audio \
+  --pair_scope global \
+  --loss_type focal \
+  --science_feature_mode analysis_concat \
+  --llm_text_source analysis \
+  --checkpoint outputs/checkpoints/best_llm_optimized.pt
+```
+
+默认输出：
+
+```text
+outputs/checkpoints/best.pt
+outputs/logs/train.log
+```
+
+checkpoint 内容：
+
+- `model_state_dict`
+- `best_threshold`
+- `config`：完整模型结构配置，用于推理阶段恢复同构模型
+- `science_feature_mode`、`llm_text_source`：推理时自动恢复同样的特征源和掩码
+- `training_config`、`seed`、`split_seed`：用于复现实验
+
+## 8. 单视频推理
+
+```bash
+cd science_video_project
 python inference/infer.py \
-    --video data/videos/demo.mp4 \
-    --checkpoint outputs/checkpoints/best.pt
-
-# 完整推理引擎
-python inference/full_infer.py \
-    --mode video \
-    --video data/videos/demo.mp4 \
-    --checkpoint outputs/checkpoints/research_best.pt
+  --video path/to/video.mp4 \
+  --checkpoint outputs/checkpoints/best_llm_optimized.pt \
+  --metadata data/parsed_metadata_filtered.csv
 ```
 
-### 7.2 输出格式
+也可以使用完整推理引擎：
+
+```bash
+python inference/full_infer.py \
+  --video path/to/video.mp4 \
+  --checkpoint outputs/checkpoints/best_llm_optimized.pt \
+  --title "视频标题" \
+  --tags "物理|科普|实验" \
+  --category "physics"
+```
+
+输出示例：
 
 ```json
 {
-  "scientific_score": 2.31,
-  "technical_score": 1.87,
-  "aesthetic_score": 2.54,
-  "quality_score": 2.19,
-  "engagement_score": 0.72,
-  "overall_score": 2.45,
-  "probability": 0.92,
-  "gate_weights": {
-    "scientific": 0.38,
-    "technical": 0.27,
-    "aesthetic": 0.35
-  },
-  "prediction": "上榜"
+  "scientific_score": 0.12,
+  "technical_score": 0.08,
+  "aesthetic_score": 0.21,
+  "overall_score": 0.34,
+  "probability": 0.5842,
+  "threshold": 0.55,
+  "prediction": "top"
 }
 ```
 
----
+## 9. 最近修复与当前状态
 
-## 8. Web 服务
+当前代码已完成以下关键修复：
 
-### 启动服务
+- checkpoint 适配逻辑只处理 MVP 模型参数，不再错误注入 research-only 参数
+- 训练和推理统一使用 checkpoint 中保存的模型配置
+- 推理阶段补齐训练使用的 DNSMOS、WPM、语速节奏、科学性手工特征、LLM 知识特征
+- DeepSeek 模型更新为 `deepseek-v4-pro`，启用 thinking mode、JSON 输出、失败重试与断点缓存
+- LLM 输出长度提高到 4096 token，避免推理过程占满预算后截断最终 JSON
+- 科学性分支新增 RoBERTa 分析文本编码，以及论文思路对应的 IFG + residual 融合
+- 元数据加载会排除同一 `video_id` 标签互相冲突的样本，并按 `video_id` 去重，防止训练/验证泄漏
+- `seed` 与 `split_seed` 已拆分，可在固定验证集上独立评估初始化稳定性
+- 推理会从 checkpoint 恢复 LLM 文本源和科学性特征掩码，避免训练/推理特征不一致
+- 验证集 pair 改为确定性生成，实验指标更容易复现
+- 推理模块降低顶层重依赖，单独加载 checkpoint 不会因为 `clip` 或 `soundfile` 缺失而失败
 
-```bash
-# MVP 模式
-python app.py
+当前数据状态：
 
-# 研究版模式
-set RESEARCH_MODE=1 && python app.py    # Windows
-RESEARCH_MODE=1 python app.py           # Linux/Mac
+```text
+唯一特征文件：379
+DeepSeek 有效缓存：379/379
+Whisper audio / DNSMOS / WPM / speech rhythm / 两套 LLM 分析向量：379/379
+去重并排除冲突标签后参与训练：342（正类 33，负类 309）
 ```
 
-访问 `http://localhost:5000`
+另有 20 个当前未参与训练的特征文件缺少 `aes_feat`。
 
-### API 端点
+## 10. 科学性实验结果
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/` | GET | 前端页面 |
-| `/api/infer` | POST | 推理接口（支持 JSON + 文件上传） |
-| `/api/health` | GET | 健康检查 |
+以下结果使用同一数据划分（`split_seed=42`）、全局 pair、focal ranking loss、`seed=42`。
+除学习率搜索外，消融学习率均为 `5e-5`：
 
----
+| 科学性方案 | 验证 pairwise Acc / AUC |
+|---|---:|
+| 无 LLM | 0.6728 |
+| 仅 4 维 LLM 评分 | 0.6751 |
+| 仅最终分析文本 RoBERTa 向量，直接拼接 | **0.7558** |
+| 最终分析向量 + 4 维评分，直接拼接 | 0.7396 |
+| 推理全文 + 最终分析 + 评分，直接拼接 | 0.7212 |
+| 最终分析向量 + 评分，IFG | 0.6659 |
+| 推理全文 + 最终分析 + 评分，IFG | 0.6682 |
+| 推理全文 + 评分 + 手工科学特征，完整 IFG | 0.6912 |
 
-## 9. 研究版升级
+对最佳结构搜索学习率后，`lr=1e-5` 在 seed 42 达到 **0.7926**（第 8 轮），
+对应 checkpoint 为 `outputs/checkpoints/best_llm_optimized.pt`。
 
-以下是相对于 MVP 的完整创新点清单：
+修复 faster-whisper encoder 接口并补齐真实 `audio_feat` 后，同配置启用音频得到 0.7857，
+显式禁用音频仍复现 0.7926；无 LLM 基线启用音频由 0.6728 提升到 0.6843。因此音频表示对基础模型
+有一定帮助，但没有提升当前 LLM 最佳组合。默认最佳 checkpoint 保存 `use_audio_feature=false`，
+启用音频的候选模型保存为 `outputs/checkpoints/best_llm_with_audio.pt`。
 
-### §4 QualityHead — 质量空间层
+结论：参考论文的“LLM 知识增强”思路可行，但当前数据上不应直接照搬 IFG。效果最好的做法是仅编码
+DeepSeek 的最终结构化分析文本并直接拼接；显式评分、完整推理文本和 IFG 都会降低单次实验指标。
+3-seed 固定划分复验仍有较大方差；`5e-5` 下分析方案均值为 0.6605，无 LLM 均值为 0.6536，
+因此论文中应把 0.7926 表述为固定划分最佳结果，而不是稳定显著提升。
 
-```
-sci_score, tech_score, aes_score (B,3)
-         ↓
-MLP(3 → 32 → 16 → 1)
-         ↓
-    quality_score (B,1)
-```
+完整结果位于：
 
-**创新点**：自动学习三维质量的最优组合规律，替代固定平均。不同场景下科学性/技术/美学的权重不同（如医学科普更重科学性）。
-
-### §5 Consistency Loss — 质量一致性约束
-
-$$L_{cons} = \text{MSE}(quality\_score, overall\_score)$$
-
-**创新点**：使排序结果具备质量语义解释——"为什么上榜"而非仅仅"是否上榜"。
-
-### §6 EngagementBranch — 传播力辅助分支
-
-```
-meta_feat(16) → MLP → engagement_score (B,1)
-```
-
-**约束**：仅在训练时作为辅助监督，不参与 final classification，避免标签泄露。
-
-### §7 ScienceFeatureExtractor — 手工科学性特征
-
-从文本中提取 5 维语言学特征：
-
-| 特征 | 计算方式 |
-|------|----------|
-| term_density | 科普关键词命中数 / 总词数 |
-| entity_count | 长词（≥3字）比例 |
-| number_density | 含数字词比例 |
-| avg_sentence_length | 平均句长（归一化） |
-| keyword_coverage | 关键词覆盖率 |
-
-与 BERT 768 维 embedding 拼接后经 `ScienceFeatureProjection` 融合。
-
-### §8 AestheticMLP — 美学特征学习
-
-```
-aes_feat(7) → MLP(7→128→64→1) → aesthetic_score
+```text
+outputs/logs/feature_diagnostics.json
+outputs/logs/feature_diagnostics_with_audio.json
+outputs/logs/science_ablation.json
+outputs/checkpoints/science_ablation/
+outputs/checkpoints/science_fixed_split/
+outputs/checkpoints/science_lr_stability/
 ```
 
-学习 CLIP Prompt 得分的非线性映射，替代简单的维度均值。
+## 11. 常见问题
 
-### §9 TemporalEncoder — 时序视频编码
+### 1. ffmpeg 找不到
 
-```
-frame_features (N, 512)
-         ↓
-BiGRU(2层, 双向) 或 TransformerEncoder(2层)
-         ↓
-    video_feature (512)
-```
+检查 `pipeline/config.py` 中的 `ffmpeg_path`，或将 ffmpeg 加入系统 PATH。
 
-**创新点**：捕捉视频帧间时序动态（镜头切换、运动变化），替代 CLIP 逐帧均值池化。
+### 2. CUDA 不可用或显存不足
 
-### §10 CrossModalAttention — 跨模态注意力融合
-
-```
-text(768), video(512), audio(384)
-         ↓
-  投影到统一维度(768)
-         ↓
-MultiHeadAttention(3 tokens, 4 heads)
-         ↓
-  残差连接 + LayerNorm
-         ↓
-enhanced_text, enhanced_video, enhanced_audio
-```
-
-在分支编码之前进行跨模态信息交换，形成"先交叉→再分支"的增强架构。
-
-### §11 Branch Diversity Loss — 分支多样性正则
-
-$$L_{div} = \frac{1}{3}\sum \cos(h_i, h_j), \quad i \neq j \in \{sci, tech, aes\}$$
-
-**创新点**：最小化分支隐向量余弦相似度，鼓励三个分支学习互补而非冗余的质量维度。
-
----
-
-## 10. 消融实验
-
-```bash
-# 查看实验矩阵
-python training/experiments.py --print_only
-
-# 运行全部 7 组实验
-python training/experiments.py --epochs 10 --batch_size 8
-
-# 不跳过已有 checkpoint
-python training/experiments.py --no_skip
-```
-
-### 实验矩阵
-
-| 实验 | QualityHead | Consistency | Temporal | CrossModal | ScienceFeat | Engagement | Diversity |
-|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Exp1** Baseline | — | — | — | — | — | — | — |
-| **Exp2** +QualityHead | ✓ | — | — | — | — | — | — |
-| **Exp3** +Consistency | ✓ | ✓ | — | — | — | — | — |
-| **Exp4** +Temporal | ✓ | ✓ | ✓ | — | — | — | — |
-| **Exp5** +CrossModal | ✓ | ✓ | ✓ | ✓ | — | — | — |
-| **Exp6** +ScienceFeat | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
-| **Exp7** Full Model | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-
----
-
-## 11. 配置说明
-
-`pipeline/config.py` 中的关键配置：
+可以在 `pipeline/config.py` 中将：
 
 ```python
-# ===== 模型维度 =====
-text_dim: int = 768        # BERT 输出维度
-video_dim: int = 512       # CLIP 输出维度
-audio_dim: int = 384       # Whisper 输出维度
-meta_dim: int = 16         # 元数据特征维度
-aes_dim: int = 7           # CLIP Prompt 美学维度
-sci_hand_dim: int = 5      # 手工科学性特征维度
-temporal_dim: int = 256    # 时序编码器隐层维度
-hidden_dim: int = 128      # 通用隐层维度
-
-# ===== 研究版开关 =====
-use_quality_head: bool = True              # §4 质量空间层
-use_consistency_loss: bool = True          # §5 一致性损失
-use_engagement_branch: bool = True         # §6 传播力分支
-use_science_features: bool = True          # §7 手工科学特征
-use_aesthetic_mlp: bool = True             # §8 美学MLP
-use_temporal_encoder: bool = True          # §9 时序编码器
-use_cross_modal_attention: bool = True     # §10 跨模态注意力
-use_diversity_loss: bool = True            # §11 多样性正则
-
-# ===== 损失权重 =====
-lambda_consistency: float = 0.2            # 一致性损失权重
-lambda_diversity: float = 0.05            # 多样性损失权重
-
-# ===== 时序编码器 =====
-temporal_arch: str = "bigru"              # "bigru" | "transformer"
-temporal_num_layers: int = 2
-temporal_num_heads: int = 4               # Transformer 模式
-
-# ===== 跨模态注意力 =====
-cross_modal_num_heads: int = 4
-cross_modal_dropout: float = 0.1
+device = "cpu"
 ```
 
----
+或者减小 `batch_size`。
 
-## 12. 常见问题
+### 3. LLM 知识特征没有 API Key
 
-<details>
-<summary><b>Q: ffmpeg 找不到</b></summary>
+主流水线未设置 `DEEPSEEK_API_KEY` 时会使用 `DummyLLMKnowledgeExtractor` 保持流程可运行，
+但该占位输出不能用于最终训练或论文实验。正式生成应使用 `prefetch_llm_cache.py`，它会在缺少 Key 时直接报错。
 
-设置环境变量 `FFMPEG_PATH` 或在 `config.py` 中配置：
-```python
-ffmpeg_path: str = r"D:\你的路径\ffmpeg\bin"
-```
-</details>
+Windows PowerShell 设置方式：
 
-<details>
-<summary><b>Q: CUDA out of memory</b></summary>
-
-减小 `batch_size`，或将 `device = "cpu"`。
-</details>
-
-<details>
-<summary><b>Q: 模型权重下载失败</b></summary>
-
-提前下载模型权重到本地目录，并设置 `local_files_only = True`。
-</details>
-
-<details>
-<summary><b>Q: 训练时正负样本不平衡</b></summary>
-
-数据集自动确保正负样本都存在。如果某类别仅有单一标签，该类别会被跳过。
-</details>
-
-<details>
-<summary><b>Q: 如何从 MVP checkpoint 热启动研究版训练？</b></summary>
-
-```bash
-python training/train_research.py --pretrained outputs/checkpoints/best.pt
+```powershell
+$env:DEEPSEEK_API_KEY="你的 API Key"
 ```
 
-新模块权重自动随机初始化，MVP 权重完全复用（70/70 keys matched）。
-</details>
+### 4. 训练时报没有正负样本
 
-<details>
-<summary><b>Q: ResearchModel 和 MultiModalQualityModel 的关系？</b></summary>
+需要确认：
 
-`ResearchModel` 是 `MultiModalQualityModel` 的**严格超集**。所有 MVP 功能完全保留，新模块通过配置开关控制。关闭所有开关后，行为与 MVP 完全一致。
-</details>
+- 元数据中同时存在 `label=1` 和 `label=0`
+- `outputs/features/` 中存在对应 `video_id.pt`
+- `video_id` 与视频文件名/元数据一致
 
----
+### 5. 推理结果和训练结果不一致
 
-## 引用
+优先检查是否使用了最新训练出的 checkpoint。当前推理脚本会读取 checkpoint 中保存的模型结构和阈值，旧 checkpoint 若缺少完整配置，会回退到当前 `CFG`。
 
-如果本项目对你的研究有帮助，请引用：
+## 12. 毕设论文可对应的技术点
 
-```bibtex
-@misc{science-video-ranker,
-  title  = {Multi-dimensional Quality Assessment Framework for Science Short Videos},
-  author = {Science Video Project},
-  year   = {2026},
-  note   = {https://github.com/funny-9t/science_video_project}
-}
-```
+可以在论文中对应展开：
+
+- 无参考科普短视频质量评估任务定义
+- 弱监督 pairwise ranking 建模
+- 科学性、技术性、美学性三分支结构
+- ASR + BERT + CLIP + Whisper + DNSMOS 多模态特征融合
+- LLM 知识特征增强科学性评估
+- 门控融合与可解释分支分数
+- 验证集固定 pair 的实验可复现设计

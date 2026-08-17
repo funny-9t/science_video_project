@@ -7,18 +7,21 @@ class Config:
     project_root: Path = Path(__file__).resolve().parents[1]
 
     data_dir: Path = project_root / "data"
-    video_dir: Path = data_dir / "videos"
+    video_dir: Path = Path(r"F:\Data\172.16.29.65")
+    cover_root: Path = Path(r"D:\Projects\COVER")
     metadata_csv: Path = data_dir / "parsed_metadata_filtered.csv"
 
     output_dir: Path = Path(r"D:\Projects\science_video_ranker_mvp\science_video_project\outputs")
     frame_dir: Path = output_dir / "frames"
     audio_dir: Path = output_dir / "audio"
+    transcript_dir: Path = output_dir / "transcripts"
     feature_dir: Path = output_dir / "features"
     checkpoint_dir: Path = output_dir / "checkpoints"
     log_dir: Path = output_dir / "logs"
 
     # extraction
     frame_fps: int = 1
+    clip_max_frames: int = 40      # global-uniform temporal samples for native CLIP sequence
     audio_sr: int = 16000
     skip_existing: bool = True
     ffmpeg_path: str = r"D:\Projects\ffmpeg-8.0.1-essentials_build\bin"
@@ -35,10 +38,17 @@ class Config:
     # dimensions
     text_dim: int = 768
     video_dim: int = 512
+    clip_video_dim: int = 768       # native ViT-L/14 projection dimension
     audio_dim: int = 384
     meta_dim: int = 16
     aes_dim: int = 7             # CLIP prompt scoring dimensions (DEFAULT_PROMPTS)
     sci_hand_dim: int = 5         # handcrafted scientific features
+    llm_knowledge_dim: int = 4    # factual, logical, evidence, uncertainty scores
+    llm_analysis_dim: int = 768   # RoBERTa encoding of DeepSeek analysis/reasoning text
+    cover_dim: int = 3            # frozen COVER semantic/technical/aesthetic scores
+    dnsmos_dim: int = 3           # DNSMOS 音频质量评分 (ovrl/sig/bak)
+    wpm_dim: int = 1              # 每分钟字数 (Words Per Minute)
+    speech_rhythm_dim: int = 6    # 段级语速节奏 (mean/std/min/max WPM + pause_ratio + speech_density)
     temporal_dim: int = 256       # temporal encoder output dim
     hidden_dim: int = 128
 
@@ -47,11 +57,16 @@ class Config:
     use_consistency_loss: bool = True          # §5: L_cons = MSE(quality, overall)
     use_engagement_branch: bool = True         # §6: engagement_score (auxiliary)
     use_science_features: bool = True          # §7: handcrafted scientific features
+    use_llm_knowledge: bool = True             # §7+: LLM 知识科学性特征 (DeepSeek)
     use_aesthetic_mlp: bool = True             # §8: MLP over aes_feat
     use_temporal_encoder: bool = True          # §9: BiGRU/Transformer over frames
     use_cross_modal_attention: bool = True     # §10: MultiHeadAttention fusion
     use_diversity_loss: bool = True            # §11: Branch diversity regularization
     use_frame_features: bool = True            # Save per-frame CLIP features (for temporal)
+    use_cross_gating: bool = False             # §12: Cross-Gating fusion (参考 COVER) — Baseline 关闭
+    use_cover_features: bool = False            # frozen COVER priors for visual branches
+    fusion_mode: str = "learned"               # learned | average
+    use_knowledge_gate: bool = True             # IFG for RoBERTa semantics and LLM knowledge
 
     # loss weights
     lambda_consistency: float = 0.2
@@ -71,6 +86,19 @@ class Config:
     cross_modal_num_heads: int = 4
     cross_modal_dropout: float = 0.1
 
+    # cross-gating config (§12, 参考 COVER)
+    cross_gating_dropout: float = 0.1
+
+    # ====== LLM 知识科学性特征配置 (§7+) ======
+    # DeepSeek V4 Pro API 配置
+    use_llm_knowledge: bool = True          # 是否启用 LLM 知识科学性特征
+    llm_api_base: str = "https://api.deepseek.com"
+    llm_model_name: str = "deepseek-v4-pro"
+    llm_api_key: str = ""                    # 从环境变量 DEEPSEEK_API_KEY 或参数传入
+    llm_temperature: float = 0.1             # 低温度提高评分稳定性
+    llm_cache_dir: str = "./cache/llm_knowledge"  # LLM 特征缓存目录
+    llm_include_reasoning: bool = True
+
     # train
     batch_size: int = 8
     num_workers: int = 0
@@ -84,11 +112,22 @@ class Config:
     val_ratio: float = 0.2
     scheduler_patience: int = 5          # ReduceLROnPlateau 耐心值（val_loss 不降则降 lr）
     scheduler_factor: float = 0.5        # lr 衰减因子
-    early_stop_patience: int = 10        # 早停耐心值（延长，给 scheduler 更多机会）
+    early_stop_patience: int = 10        # 早停耐心值
     pos_aug_noise: float = 0.05          # 正样本特征级增强：高斯噪声标准差
 
+    # ====== Regression Training (train_regression.py) ======
+    regression_epochs: int = 50
+    regression_batch_size: int = 16
+    regression_lr: float = 3e-4
+    regression_weight_decay: float = 1e-3
+    regression_lambda_consistency: float = 0.1
+    regression_scheduler_patience: int = 8
+    regression_scheduler_factor: float = 0.5
+    regression_early_stop_patience: int = 15
+    regression_val_ratio: float = 0.15
+
     # experiment config
-    experiment_name: str = "full"               # baseline | quality_head | consistency | temporal | cross_modal | science_feat | full
+    experiment_name: str = "full"               # baseline | quality_head | consistency | temporal | cross_modal | science_feat | full | regression
 
 
 CFG = Config()

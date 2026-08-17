@@ -65,28 +65,35 @@ class AestheticMLP(nn.Module):
 # ============================================================================
 
 class ScienceFeatureProjection(nn.Module):
-    """BERT embedding + 手工科学性特征 → 增强的文本表征。"""
+    """BERT embedding + 手工科学性特征 + LLM 知识特征 → 增强的文本表征。"""
 
-    def __init__(self, bert_dim: int = 768, sci_hand_dim: int = 5, hidden_dim: int = 128):
+    def __init__(self, bert_dim: int = 768, sci_hand_dim: int = 5,
+                 llm_knowledge_dim: int = 2, hidden_dim: int = 128):
         super().__init__()
+        total_in = bert_dim + sci_hand_dim + llm_knowledge_dim
         self.fuse = nn.Sequential(
-            nn.Linear(bert_dim + sci_hand_dim, hidden_dim),
+            nn.Linear(total_in, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, bert_dim),
             nn.ReLU(),
         )
 
-    def forward(self, text_feat: torch.Tensor, sci_hand_feat: torch.Tensor) -> torch.Tensor:
+    def forward(self, text_feat: torch.Tensor, sci_hand_feat: torch.Tensor,
+                llm_knowledge_feat: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            text_feat:     (B, 768) BERT embedding
-            sci_hand_feat: (B, 5)   手工科学性特征
+            text_feat:          (B, 768) BERT embedding
+            sci_hand_feat:      (B, 5)   手工科学性特征
+            llm_knowledge_feat: (B, 2)   LLM 知识科学性特征 [§7+]
 
         Returns:
             enhanced_text: (B, 768)
         """
-        combined = torch.cat([text_feat, sci_hand_feat], dim=-1)
+        if llm_knowledge_feat is None:
+            llm_knowledge_feat = torch.zeros(
+                text_feat.size(0), 2, device=text_feat.device, dtype=text_feat.dtype)
+        combined = torch.cat([text_feat, sci_hand_feat, llm_knowledge_feat], dim=-1)
         return self.fuse(combined)
 
 
@@ -116,6 +123,7 @@ class ResearchModel(nn.Module):
         meta_dim: int = 16,
         aes_dim: int = 7,
         sci_hand_dim: int = 5,
+        llm_knowledge_dim: int = 2,        # §7+
         hidden_dim: int = 128,
         use_quality_head: bool = True,
         use_engagement_branch: bool = True,
@@ -123,17 +131,20 @@ class ResearchModel(nn.Module):
         use_aesthetic_mlp: bool = True,
         use_temporal_encoder: bool = True,
         use_cross_modal_attention: bool = True,
+        use_cross_gating: bool = True,
         temporal_dim: int = 256,
         temporal_arch: str = "bigru",
         temporal_num_layers: int = 2,
         temporal_num_heads: int = 4,
         cross_modal_num_heads: int = 4,
         cross_modal_dropout: float = 0.1,
+        cross_gating_dropout: float = 0.1,
     ):
         super().__init__()
 
         # --- 核心三分支模型 (保持原有键名，兼容旧 checkpoint) ---
-        self.scientific_branch = ScientificBranch(text_dim, meta_dim, hidden_dim)
+        self.scientific_branch = ScientificBranch(text_dim, meta_dim, hidden_dim,
+                                                  llm_knowledge_dim=llm_knowledge_dim)
         self.technical_branch = TechnicalBranch(video_dim, audio_dim, meta_dim, hidden_dim)
         self.aesthetic_branch = AestheticBranch(video_dim, text_dim, audio_dim, aes_dim, hidden_dim)
 
@@ -156,7 +167,7 @@ class ResearchModel(nn.Module):
         # --- §10 Cross-Modal Attention ---
         self.use_cross_modal_attention = use_cross_modal_attention
         if use_cross_modal_attention:
-            from training.cross_modal_attention import CrossModalAttention
+            from science_video_project.training.research.cross_modal_attention import CrossModalAttention
             self.cross_modal_attn = CrossModalAttention(
                 text_dim=text_dim,
                 video_dim=video_dim,
@@ -167,11 +178,20 @@ class ResearchModel(nn.Module):
         else:
             self.cross_modal_attn = None
 
+        # --- §12 Cross-Gating Fusion (参考 COVER) ---
+        self.use_cross_gating = use_cross_gating
+        if use_cross_gating:
+            from training.cross_gating import DualCrossGating
+            self.cross_gating = DualCrossGating(dim=hidden_dim, dropout=cross_gating_dropout)
+        else:
+            self.cross_gating = None
+
         # --- §7 Science Feature Projection ---
         self.use_science_features = use_science_features
         if use_science_features:
             self.sci_feat_proj = ScienceFeatureProjection(
-                bert_dim=text_dim, sci_hand_dim=sci_hand_dim, hidden_dim=hidden_dim
+                bert_dim=text_dim, sci_hand_dim=sci_hand_dim,
+                llm_knowledge_dim=llm_knowledge_dim, hidden_dim=hidden_dim
             )
         else:
             self.sci_feat_proj = None
@@ -186,7 +206,7 @@ class ResearchModel(nn.Module):
         # --- §9 Temporal Encoder ---
         self.use_temporal_encoder = use_temporal_encoder
         if use_temporal_encoder:
-            from training.step_temporal import TemporalEncoder
+            from science_video_project.training.research.step_temporal import TemporalEncoder
             self.temporal_encoder = TemporalEncoder(
                 input_dim=video_dim,
                 hidden_dim=temporal_dim,
@@ -201,7 +221,7 @@ class ResearchModel(nn.Module):
         # --- §4 Quality Head ---
         self.use_quality_head = use_quality_head
         if use_quality_head:
-            from training.quality_head import QualityHead
+            from science_video_project.training.research.quality_head import QualityHead
             self.quality_head = QualityHead(input_dim=3, hidden1=32, hidden2=16)
         else:
             self.quality_head = None
@@ -209,7 +229,7 @@ class ResearchModel(nn.Module):
         # --- §6 Engagement Branch ---
         self.use_engagement_branch = use_engagement_branch
         if use_engagement_branch:
-            from training.engagement_branch import EngagementBranch
+            from science_video_project.training.research.engagement_branch import EngagementBranch
             self.engagement_branch = EngagementBranch(meta_dim=meta_dim, hidden_dim=hidden_dim)
         else:
             self.engagement_branch = None
@@ -226,6 +246,7 @@ class ResearchModel(nn.Module):
         meta_feat: torch.Tensor,
         aes_feat: torch.Tensor | None = None,
         sci_hand_feat: torch.Tensor | None = None,
+        llm_knowledge_feat: torch.Tensor | None = None,  # §7+
         frame_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
@@ -236,6 +257,7 @@ class ResearchModel(nn.Module):
             meta_feat:     (B, 16)
             aes_feat:      (B, 7)    — 可选，缺失时填零
             sci_hand_feat: (B, 5)    — 可选
+            llm_knowledge_feat: (B, 2) — 可选，LLM 知识科学性特征 [§7+]
             frame_features:(B, N, 512) — 可选，时序编码器的帧序列
 
         Returns:
@@ -264,14 +286,16 @@ class ResearchModel(nn.Module):
         else:
             t_cross, v_cross, a_cross = text_feat, video_feat, audio_feat
 
-        # --- §7 Science Feature Projection: BERT + 手工特征 ---
+        # --- §7 Science Feature Projection: BERT + 手工特征 + LLM 知识 ---
         if self.use_science_features and self.sci_feat_proj is not None and sci_hand_feat is not None:
-            text_enhanced = self.sci_feat_proj(t_cross, sci_hand_feat)
+            text_enhanced = self.sci_feat_proj(t_cross, sci_hand_feat,
+                                               llm_knowledge_feat=llm_knowledge_feat)
         else:
             text_enhanced = t_cross
 
         # --- 三分支编码 ---
-        sci_h, sci_s = self.scientific_branch(text_enhanced, meta_feat)
+        sci_h, sci_s = self.scientific_branch(text_enhanced, meta_feat,
+                                              llm_knowledge_feat=llm_knowledge_feat)
         tech_h, tech_s = self.technical_branch(v_cross, a_cross, meta_feat)
 
         # AestheticBranch 始终接收原始 7-dim aes_feat 用于内部处理
@@ -280,6 +304,10 @@ class ResearchModel(nn.Module):
         # §8 Aesthetic MLP — 学习非线性美学评分，覆盖分支原始得分
         if self.use_aesthetic_mlp and self.aesthetic_mlp is not None:
             aes_s = self.aesthetic_mlp(aes_feat)  # (B, 1) — 覆盖分支得分
+
+        # --- §12 Cross-Gating: 科学性 hidden 门控技术/美学 hidden ---
+        if self.use_cross_gating and self.cross_gating is not None:
+            tech_h, aes_h = self.cross_gating(sci_h, tech_h, aes_h)
 
         # --- §4 Quality Head: 质量空间 ---
         quality_score: torch.Tensor | None = None

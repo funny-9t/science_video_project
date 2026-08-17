@@ -9,12 +9,13 @@ from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModelWi
 
 
 class VideoEncoder:
-    def __init__(self, model_name: str = "ViT-B/32", device: str = "cuda"):
+    def __init__(self, model_name: str = "ViT-B/32", device: str = "cuda", batch_size: int = 32):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.backend = "openai"
         self.preprocess = None
         self.processor = None
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self.batch_size = max(1, int(batch_size))
 
         resolved = self._resolve_clip_model(model_name)
         if resolved["backend"] == "hf":
@@ -74,30 +75,65 @@ class VideoEncoder:
         processor = CLIPImageProcessor.from_pretrained(path, local_files_only=True)
         return model, processor
 
-    def encode_frames(self, frame_dir: str | Path) -> torch.Tensor:
+    @staticmethod
+    def _global_uniform_paths(frame_paths: list[Path], max_frames: int | None) -> list[Path]:
+        if max_frames is None or max_frames <= 0 or len(frame_paths) <= max_frames:
+            return frame_paths
+        indices = torch.linspace(0, len(frame_paths) - 1, steps=max_frames).round().long().tolist()
+        return [frame_paths[index] for index in indices]
+
+    def encode_frame_features(
+        self,
+        frame_dir: str | Path,
+        max_frames: int | None = None,
+    ) -> torch.Tensor:
+        """Return one native CLIP embedding per sampled frame.
+
+        CLIP embedding channels are not spatially ordered, so adaptive pooling
+        across the channel axis is not a valid dimensionality projection.  The
+        native sequence is kept for temporal modelling and COVER-style fusion.
+        """
         frame_paths = sorted(Path(frame_dir).glob("*.jpg"))
         if not frame_paths:
             raise RuntimeError(f"No frame images in {frame_dir}")
+        frame_paths = self._global_uniform_paths(frame_paths, max_frames)
 
         feats = []
         with torch.no_grad():
-            for p in frame_paths:
-                img = Image.open(p).convert("RGB")
+            for start in range(0, len(frame_paths), self.batch_size):
+                images = []
+                for path in frame_paths[start : start + self.batch_size]:
+                    with Image.open(path) as image:
+                        images.append(image.convert("RGB"))
                 if self.backend == "hf":
-                    inputs = self.processor(images=img, return_tensors="pt")
+                    inputs = self.processor(images=images, return_tensors="pt")
                     pixel_values = inputs["pixel_values"].to(self.device, dtype=self.model.dtype)
                     outputs = self.model(pixel_values=pixel_values)
                     feat = outputs.image_embeds
                 else:
-                    image = self.preprocess(img).unsqueeze(0).to(self.device)
-                    feat = self.model.encode_image(image)
+                    batch = torch.stack([self.preprocess(image) for image in images]).to(self.device)
+                    feat = self.model.encode_image(batch)
 
                 feat = feat / feat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-                feats.append(feat.squeeze(0).detach().cpu())
+                feats.append(feat.detach().cpu())
 
-        video_feat = torch.stack(feats, dim=0).mean(dim=0).float()
-        if video_feat.numel() != 512:
-            video_feat = F.adaptive_avg_pool1d(video_feat.view(1, 1, -1), 512).view(-1)
-        if video_feat.numel() != 512:
-            raise RuntimeError(f"video embedding dimension must be 512, got {video_feat.numel()}")
-        return video_feat
+        return torch.cat(feats, dim=0).float()
+
+    def encode_native_video(
+        self,
+        frame_dir: str | Path,
+        max_frames: int | None = None,
+    ) -> torch.Tensor:
+        """Mean-pool frames while preserving CLIP's native embedding space."""
+        return self.encode_frame_features(frame_dir, max_frames=max_frames).mean(dim=0)
+
+    @staticmethod
+    def legacy_project(video_feat: torch.Tensor, output_dim: int = 512) -> torch.Tensor:
+        """Reproduce the historical 512-d feature for old checkpoints only."""
+        if video_feat.numel() == output_dim:
+            return video_feat.float()
+        return F.adaptive_avg_pool1d(video_feat.view(1, 1, -1), output_dim).view(-1).float()
+
+    def encode_frames(self, frame_dir: str | Path) -> torch.Tensor:
+        """Backward-compatible legacy feature used by existing checkpoints."""
+        return self.legacy_project(self.encode_native_video(frame_dir), output_dim=512)

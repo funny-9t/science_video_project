@@ -28,9 +28,9 @@ from pipeline.utils_io import ensure_dir, load_metadata
 from training.dataloader_pair import collate_pair
 from training.dataset_pair import PairwiseVideoDataset
 from training.losses import pairwise_ranking_loss, branch_consistency_loss
-from training.losses_research import compute_research_total_loss
+from science_video_project.training.research.losses_research import compute_research_total_loss
 from training.metrics import compute_pair_metrics
-from training.model_research import ResearchModel
+from science_video_project.training.research.model_research import ResearchModel
 from training.utils_train import build_logger, get_device, move_batch_to_device, set_seed
 
 
@@ -187,12 +187,14 @@ def main() -> None:
         use_aesthetic_mlp=bool(args.aesthetic_mlp),
         use_temporal_encoder=bool(args.temporal_encoder),
         use_cross_modal_attention=bool(args.cross_modal_attn),
+        use_cross_gating=CFG.use_cross_gating,
         temporal_dim=CFG.temporal_dim,
         temporal_arch=CFG.temporal_arch,
         temporal_num_layers=CFG.temporal_num_layers,
         temporal_num_heads=CFG.temporal_num_heads,
         cross_modal_num_heads=CFG.cross_modal_num_heads,
         cross_modal_dropout=CFG.cross_modal_dropout,
+        cross_gating_dropout=CFG.cross_gating_dropout,
     ).to(device)
 
     # Warm-start from MVP checkpoint

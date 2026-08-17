@@ -60,7 +60,7 @@ def parse_fans(fans_str: str) -> str:
 
 
 def main():
-    src = Path(r"d:\Projects\science_video_ranker_mvp\已标注数据.csv")
+    src = Path(r"d:\Projects\science_video_ranker_mvp\已标注数据_已解析_clean.csv")
     dst = Path(r"d:\Projects\science_video_ranker_mvp\science_video_project\data\parsed_metadata.csv")
 
     # 读取原始 CSV（跳过第2行子表头）
@@ -120,11 +120,7 @@ def main():
             continue
 
         label_raw = get_val("是否上榜")
-        # 兼容新旧标签格式: "是"/"上榜视频" → 1, "否"/"该条未上榜" → 0
-        if label_raw in ("是", "上榜视频"):
-            label = "1"
-        else:
-            label = "0"
+        label = "1" if label_raw == "1" else "0"
 
         # ── 七项细粒度评分 (列索引 8-14，固定位置，Row2 中的名称) ──
         # [8]科普信息量  [9]选题重要性  [10]科普通俗性  [11]内容趣味性

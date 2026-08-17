@@ -1,7 +1,7 @@
 from typing import Dict
 
 import numpy as np
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 
 
 def accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -39,4 +39,25 @@ def compute_pair_metrics(pos_prob: np.ndarray, neg_prob: np.ndarray, threshold: 
         "f1": f1(y_true, y_pred),
         "auc": auc(y_true, y_score),
         "ranking_accuracy": ranking_accuracy(pos_prob, neg_prob),
+    }
+
+
+def compute_video_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    """Metrics over unique videos rather than repeated validation pairs."""
+    y_true = np.asarray(y_true).reshape(-1).astype(int)
+    y_score = np.asarray(y_score).reshape(-1)
+    y_pred = (y_score >= threshold).astype(int)
+    try:
+        pr_auc = float(average_precision_score(y_true, y_score))
+    except Exception:
+        pr_auc = 0.0
+    return {
+        "accuracy": accuracy(y_true, y_pred),
+        "f1": f1(y_true, y_pred),
+        "auc": auc(y_true, y_score),
+        "pr_auc": pr_auc,
     }

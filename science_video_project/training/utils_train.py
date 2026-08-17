@@ -1,6 +1,7 @@
 import logging
 import random
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,60 +22,92 @@ def get_device(device: str) -> torch.device:
 
 
 def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-    return {k: v.to(device) for k, v in batch.items()}
+    return {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
 
 
-def adapt_checkpoint_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """将旧版 checkpoint 适配到当前模型架构。
+def build_model_config_from_cfg(cfg: Any) -> dict[str, Any]:
+    """Return the MVP model arguments that must stay in sync across train/infer."""
+    return {
+        "text_dim": int(cfg.text_dim),
+        "video_dim": int(cfg.video_dim),
+        "audio_dim": int(cfg.audio_dim),
+        "meta_dim": int(cfg.meta_dim),
+        "aes_dim": int(cfg.aes_dim),
+        "dnsmos_dim": int(cfg.dnsmos_dim),
+        "wpm_dim": int(cfg.wpm_dim),
+        "rhythm_dim": int(cfg.speech_rhythm_dim),
+        "llm_knowledge_dim": int(cfg.llm_knowledge_dim),
+        "llm_analysis_dim": int(cfg.llm_analysis_dim),
+        "sci_hand_dim": int(cfg.sci_hand_dim),
+        "cover_dim": int(cfg.cover_dim),
+        "use_cover_features": bool(cfg.use_cover_features),
+        "fusion_mode": str(cfg.fusion_mode),
+        "use_knowledge_gate": bool(cfg.use_knowledge_gate),
+        "hidden_dim": int(cfg.hidden_dim),
+        "use_cross_gating": bool(cfg.use_cross_gating),
+        "cross_gating_dropout": float(cfg.cross_gating_dropout),
+    }
 
-    适配内容:
-      1. gate 模块缺失 → 自动初始化
-      2. aesthetic_branch.aes_proj 缺失 → 随机初始化
-      3. fusion.0 输入维度扩展 (387 → 131)
-      4. 研究版新增模块缺失 → 零/随机初始化 (quality_head, cross_modal_attn,
-         sci_feat_proj, aesthetic_mlp, temporal_encoder, engagement_branch)
 
-    Returns:
-        适配后的 state_dict。
-    """
+def merge_checkpoint_model_config(ckpt: Any, default_config: dict[str, Any]) -> dict[str, Any]:
+    """Use saved config when present, falling back to current CFG for old checkpoints."""
+    merged = dict(default_config)
+    if isinstance(ckpt, dict) and isinstance(ckpt.get("config"), dict):
+        merged.update(ckpt["config"])
+    return merged
+
+
+def adapt_checkpoint_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    model_state_dict: dict[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Adapt older MVP checkpoints without adding research-only parameters."""
     adapted = dict(state_dict)
 
-    # --- 推断 hidden_dim ---
     hidden_dim = 128
-    for key in ("aesthetic_branch.video_proj.net.0.weight",
-                "aesthetic_branch.text_proj.net.0.weight",
-                "fusion.0.weight"):
+    for key in (
+        "aesthetic_branch.video_proj.net.0.weight",
+        "aesthetic_branch.text_proj.net.0.weight",
+        "fusion.0.weight",
+    ):
         if key in adapted:
             hidden_dim = adapted[key].shape[0]
             break
 
-    # --- 1) 适配 gate 模块 ---
     has_gate = any(k.startswith("gate.") for k in state_dict)
-    if not has_gate:
-        print("  [adapt] Detected legacy checkpoint (no gate) — converting...")
-        old_w = adapted["fusion.0.weight"]
+    legacy_fusion_key = "fusion.0.weight"
+    if (
+        not has_gate
+        and legacy_fusion_key in adapted
+        and adapted[legacy_fusion_key].ndim == 2
+        and adapted[legacy_fusion_key].shape[1] == hidden_dim * 3 + 3
+    ):
+        print("  [adapt] Detected legacy checkpoint without gate; converting fusion weights.")
+        old_w = adapted[legacy_fusion_key]
         old_b = adapted["fusion.0.bias"]
 
-        w_hidden = old_w[:, :384]
+        w_hidden = old_w[:, : hidden_dim * 3]
         w_hidden_avg = w_hidden.view(hidden_dim, 3, -1).mean(dim=1)
-        w_scores = old_w[:, 384:]
-        adapted["fusion.0.weight"] = torch.cat([w_hidden_avg, w_scores], dim=1)
+        w_scores = old_w[:, hidden_dim * 3 :]
+        adapted[legacy_fusion_key] = torch.cat([w_hidden_avg, w_scores], dim=1)
         adapted["fusion.0.bias"] = old_b
 
-        gate_0_w = torch.zeros(hidden_dim, 384)
-        gate_0_w[:, 32:96] = 0.1
-        gate_0_w[:, 160:224] = 0.1
-        gate_0_w[:, 288:352] = 0.1
+        gate_0_w = torch.zeros(hidden_dim, hidden_dim * 3)
+        gate_0_w[:, :hidden_dim] = 0.1
+        gate_0_w[:, hidden_dim : hidden_dim * 2] = 0.1
+        gate_0_w[:, hidden_dim * 2 :] = 0.1
         adapted["gate.0.weight"] = gate_0_w
         adapted["gate.0.bias"] = torch.zeros(hidden_dim)
         adapted["gate.3.weight"] = torch.zeros(3, hidden_dim)
         adapted["gate.3.bias"] = torch.zeros(3)
-        print("  [adapt] ✓ Gate module converted successfully")
+        print("  [adapt] Gate module converted.")
 
-    # --- 2) 适配 aesthetic_branch.aes_proj ---
     has_aes_proj = any(k.startswith("aesthetic_branch.aes_proj.") for k in state_dict)
-    if not has_aes_proj:
-        print("  [adapt] Initializing missing aes_proj weights...")
+    if not has_aes_proj and "aesthetic_branch.fuse.net.0.weight" in adapted:
+        print("  [adapt] Initializing missing aes_proj weights.")
         adapted["aesthetic_branch.aes_proj.net.0.weight"] = torch.randn(hidden_dim, 7) * 0.02
         adapted["aesthetic_branch.aes_proj.net.0.bias"] = torch.zeros(hidden_dim)
         adapted["aesthetic_branch.aes_proj.net.3.weight"] = torch.randn(hidden_dim, hidden_dim) * 0.02
@@ -82,71 +115,18 @@ def adapt_checkpoint_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str
 
         old_fuse_w = adapted["aesthetic_branch.fuse.net.0.weight"]
         new_fuse_w = torch.zeros(hidden_dim, hidden_dim * 4)
-        new_fuse_w[:, :384] = old_fuse_w
+        new_fuse_w[:, : old_fuse_w.shape[1]] = old_fuse_w
         adapted["aesthetic_branch.fuse.net.0.weight"] = new_fuse_w
-        print("  [adapt] ✓ aes_proj initialized, fuse weight expanded 384→512")
+        print("  [adapt] aes_proj initialized.")
 
-    # --- 3) 研究版新模块自适应初始化 (ResearchModel 新增) ---
+    if model_state_dict is not None:
+        adapted = {
+            k: v
+            for k, v in adapted.items()
+            if k in model_state_dict and tuple(v.shape) == tuple(model_state_dict[k].shape)
+        }
 
-    # quality_head
-    has_qh = any(k.startswith("quality_head.") for k in state_dict)
-    if not has_qh:
-        print("  [adapt] Initializing quality_head (3→32→16→1)...")
-        adapted["quality_head.net.0.weight"] = torch.randn(32, 3) * 0.02
-        adapted["quality_head.net.0.bias"] = torch.zeros(32)
-        adapted["quality_head.net.3.weight"] = torch.randn(16, 32) * 0.02
-        adapted["quality_head.net.3.bias"] = torch.zeros(16)
-        adapted["quality_head.net.6.weight"] = torch.randn(1, 16) * 0.02
-        adapted["quality_head.net.6.bias"] = torch.zeros(1)
-
-    # cross_modal_attn
-    has_cm = any(k.startswith("cross_modal_attn.") for k in state_dict)
-    if not has_cm:
-        print("  [adapt] Initializing cross_modal_attn (random init)...")
-
-    # sci_feat_proj
-    has_sf = any(k.startswith("sci_feat_proj.") for k in state_dict)
-    if not has_sf:
-        print("  [adapt] Initializing sci_feat_proj (768+5→768)...")
-        adapted["sci_feat_proj.fuse.0.weight"] = torch.randn(hidden_dim, 773) * 0.02
-        adapted["sci_feat_proj.fuse.0.bias"] = torch.zeros(hidden_dim)
-        adapted["sci_feat_proj.fuse.3.weight"] = torch.randn(768, hidden_dim) * 0.02
-        adapted["sci_feat_proj.fuse.3.bias"] = torch.zeros(768)
-
-    # aesthetic_mlp
-    has_am = any(k.startswith("aesthetic_mlp.") for k in state_dict)
-    if not has_am:
-        print("  [adapt] Initializing aesthetic_mlp (7→128→64→1)...")
-        adapted["aesthetic_mlp.net.0.weight"] = torch.randn(hidden_dim, 7) * 0.02
-        adapted["aesthetic_mlp.net.0.bias"] = torch.zeros(hidden_dim)
-        adapted["aesthetic_mlp.net.3.weight"] = torch.randn(hidden_dim // 2, hidden_dim) * 0.02
-        adapted["aesthetic_mlp.net.3.bias"] = torch.zeros(hidden_dim // 2)
-        adapted["aesthetic_mlp.net.6.weight"] = torch.randn(1, hidden_dim // 2) * 0.02
-        adapted["aesthetic_mlp.net.6.bias"] = torch.zeros(1)
-
-    # engagement_branch
-    has_eg = any(k.startswith("engagement_branch.") for k in state_dict)
-    if not has_eg:
-        print("  [adapt] Initializing engagement_branch...")
-        adapted["engagement_branch.mlp.net.0.weight"] = torch.randn(hidden_dim, 16) * 0.02
-        adapted["engagement_branch.mlp.net.0.bias"] = torch.zeros(hidden_dim)
-        adapted["engagement_branch.mlp.net.3.weight"] = torch.randn(hidden_dim, hidden_dim) * 0.02
-        adapted["engagement_branch.mlp.net.3.bias"] = torch.zeros(hidden_dim)
-        adapted["engagement_branch.score_head.0.weight"] = torch.randn(64, hidden_dim) * 0.02
-        adapted["engagement_branch.score_head.0.bias"] = torch.zeros(64)
-        adapted["engagement_branch.score_head.3.weight"] = torch.randn(1, 64) * 0.02
-        adapted["engagement_branch.score_head.3.bias"] = torch.zeros(1)
-
-    # temporal_encoder
-    has_te = any(k.startswith("temporal_encoder.") for k in state_dict)
-    if not has_te:
-        print("  [adapt] Temporal encoder weights will be randomly initialized on first use")
-
-    missing_keys = [k for k in adapted.keys() if k not in state_dict]
-    if missing_keys:
-        print(f"  [adapt] Added {len(missing_keys)} new keys: {missing_keys[:5]}...")
-
-    print("  [adapt] ✓ Checkpoint adaptation complete")
+    print("  [adapt] Checkpoint adaptation complete.")
     return adapted
 
 

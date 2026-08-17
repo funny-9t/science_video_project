@@ -3,8 +3,8 @@ import pandas as pd
 from pathlib import Path
 
 meta = pd.read_csv('parsed_metadata.csv')
-video_dir = Path('videos')
-available = {p.stem.replace('douyin.wtf_douyin_', '') for p in video_dir.glob('*.mp4')}
+video_dir = Path(r'F:\Data\172.16.29.65')
+available = {p.stem.replace('douyin.wtf_douyin_', '') for p in video_dir.rglob('*.mp4')}
 
 filtered = meta[meta['video_id'].astype(str).isin(available)].copy()
 

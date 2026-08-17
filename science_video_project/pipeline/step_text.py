@@ -1,14 +1,16 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
-from faster_whisper import WhisperModel
 from transformers import AutoModel, AutoTokenizer
+
+from pipeline.step_speech_features import SpeechTranscriber
 
 
 @dataclass
 class TextEncodeResult:
     subtitle: str
     embedding: torch.Tensor
+    segments: list = field(default_factory=list)  # [(start_sec, end_sec, text), ...]
 
 
 class TextEncoder:
@@ -20,24 +22,21 @@ class TextEncoder:
         local_files_only: bool = True,
     ):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
-        self.compute_type = "float16" if self.device.type == "cuda" else "int8"
-        asr_device = "cuda" if self.device.type == "cuda" else "cpu"
-        try:
-            self.asr = WhisperModel(asr_model_path, device=asr_device, compute_type=self.compute_type)
-        except RuntimeError:
-            self.asr = WhisperModel(asr_model_path, device="cpu", compute_type="int8")
+        self.transcriber = SpeechTranscriber(asr_model_path, device=device, batch_size=8)
+        self.asr = self.transcriber.model
 
         self.tokenizer = AutoTokenizer.from_pretrained(text_model_name, local_files_only=local_files_only)
         self.text_model = AutoModel.from_pretrained(text_model_name, local_files_only=local_files_only).to(self.device)
         self.text_model.eval()
 
-    def audio_to_text(self, wav_path: str) -> str:
+    def audio_to_text(self, wav_path: str) -> tuple[str, list]:
+        """ASR 转录，返回 (全文, [(start, end, text), ...])。"""
         try:
-            segments, _ = self.asr.transcribe(wav_path)
-            text = " ".join(seg.text.strip() for seg in segments if seg.text)
-            return text.strip()
+            result = self.transcriber.transcribe(wav_path)
+            self.asr = self.transcriber.model
+            return result.text, result.segments
         except Exception:
-            return ""
+            return "", []
 
     def text_embedding(self, text: str) -> torch.Tensor:
         content = (text or "").strip()
@@ -60,7 +59,7 @@ class TextEncoder:
         return cls_feat.detach().cpu().float()
 
     def encode_fields(self, wav_path: str, title: str, tags: str) -> TextEncodeResult:
-        subtitle = self.audio_to_text(wav_path)
+        subtitle, seg_list = self.audio_to_text(wav_path)
         merged = " ".join([x for x in [title or "", tags or "", subtitle or ""] if x]).strip()
         emb = self.text_embedding(merged)
-        return TextEncodeResult(subtitle=subtitle, embedding=emb)
+        return TextEncodeResult(subtitle=subtitle, embedding=emb, segments=seg_list)
