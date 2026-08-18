@@ -45,6 +45,7 @@ def build_model_config_from_cfg(cfg: Any) -> dict[str, Any]:
         "cover_dim": int(cfg.cover_dim),
         "use_cover_features": bool(cfg.use_cover_features),
         "fusion_mode": str(cfg.fusion_mode),
+        "branch_weight_floor": float(getattr(cfg, "branch_weight_floor", 0.0)),
         "use_knowledge_gate": bool(cfg.use_knowledge_gate),
         "hidden_dim": int(cfg.hidden_dim),
         "use_cross_gating": bool(cfg.use_cross_gating),

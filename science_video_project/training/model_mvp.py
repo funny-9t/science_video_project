@@ -248,11 +248,14 @@ class MultiModalQualityModel(nn.Module):
                  hidden_dim: int = 128,
                  use_cross_gating: bool = True, cross_gating_dropout: float = 0.1,
                  cover_dim: int = 3, use_cover_features: bool = False,
-                 fusion_mode: str = "learned"):
+                 fusion_mode: str = "learned", branch_weight_floor: float = 0.0):
         super().__init__()
         if fusion_mode not in {"learned", "average"}:
             raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
+        if not 0.0 <= branch_weight_floor < 1.0 / 3.0:
+            raise ValueError("branch_weight_floor must be in [0, 1/3).")
         self.fusion_mode = fusion_mode
+        self.branch_weight_floor = float(branch_weight_floor)
         self.use_cover_features = use_cover_features
         self.scientific_branch = ScientificBranch(text_dim, meta_dim, hidden_dim,
                                                   llm_knowledge_dim=llm_knowledge_dim,
@@ -345,6 +348,9 @@ class MultiModalQualityModel(nn.Module):
         else:
             gate_in = torch.cat([sci_h, tech_h, aes_h], dim=-1)
             weights = torch.softmax(self.gate(gate_in), dim=-1)
+            if self.branch_weight_floor > 0.0:
+                residual = 1.0 - 3.0 * self.branch_weight_floor
+                weights = self.branch_weight_floor + residual * weights
             fused_h = (
                 weights[:, 0:1] * sci_h
                 + weights[:, 1:2] * tech_h

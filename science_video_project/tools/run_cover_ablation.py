@@ -17,6 +17,38 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENTS = {
     "baseline_legacy": [],
     "ranknet_calibrated": ["--loss_type", "ranknet", "--lambda_pointwise", "0.1"],
+    "ranknet_no_llm": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--science_feature_mode", "none",
+    ],
+    "ranknet_scores_only": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--science_feature_mode", "scores",
+    ],
+    "ranknet_analysis_only": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--science_feature_mode", "analysis_concat", "--llm_text_source", "analysis",
+    ],
+    "ranknet_floor_005": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--branch_weight_floor", "0.05",
+    ],
+    "ranknet_floor_010": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--branch_weight_floor", "0.10",
+    ],
+    "ranknet_floor_015": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--branch_weight_floor", "0.15",
+    ],
+    "ranknet_floor_020": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--branch_weight_floor", "0.20",
+    ],
+    "ranknet_floor_025": [
+        "--loss_type", "ranknet", "--lambda_pointwise", "0.1",
+        "--branch_weight_floor", "0.25",
+    ],
     "native_clip": [
         "--loss_type", "ranknet", "--lambda_pointwise", "0.1", "--use_native_clip",
     ],
@@ -84,6 +116,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument(
+        "--science-feature-mode",
+        choices=["none", "scores", "analysis_concat", "analysis_scores_concat", "analysis_scores_ifg", "full_ifg"],
+        default="analysis_scores_concat",
+    )
+    parser.add_argument(
+        "--llm-text-source",
+        choices=["analysis", "reasoning_and_analysis"],
+        default="reasoning_and_analysis",
+    )
+    parser.add_argument("--disable-audio", action="store_true")
+    parser.add_argument(
         "--output-dir", type=Path,
         default=PROJECT_ROOT / "outputs" / "checkpoints" / "cover_ablation",
     )
@@ -144,11 +187,12 @@ def main() -> None:
                 "--seed", str(seed),
                 "--split_seed", str(args.split_seed),
                 "--pair_scope", "global",
-                "--disable_audio",
-                "--science_feature_mode", "analysis_concat",
-                "--llm_text_source", "analysis",
+                "--science_feature_mode", args.science_feature_mode,
+                "--llm_text_source", args.llm_text_source,
                 "--checkpoint", str(checkpoint),
             ]
+            if args.disable_audio:
+                command.append("--disable_audio")
             if name == "baseline_legacy":
                 command += ["--loss_type", "focal"]
             command += EXPERIMENTS[name]
