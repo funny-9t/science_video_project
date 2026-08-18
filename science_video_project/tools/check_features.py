@@ -14,7 +14,7 @@ from pipeline.utils_io import load_metadata
 
 
 def main() -> None:
-    root = PROJECT_ROOT / "outputs" / "features"
+    root = CFG.feature_dir
     expected = {
         "text_feat": 768,
         "video_feat": 512,

@@ -379,7 +379,7 @@ python inference/full_infer.py \
 - 训练和推理统一使用 checkpoint 中保存的模型配置
 - 推理阶段补齐训练使用的 DNSMOS、WPM、语速节奏、科学性手工特征、LLM 知识特征
 - DeepSeek 模型更新为 `deepseek-v4-pro`，启用 thinking mode、JSON 输出、失败重试与断点缓存
-- LLM 输出长度提高到 4096 token，避免推理过程占满预算后截断最终 JSON
+- LLM 输出长度提高到 8192 token，避免高强度推理过程占满预算后截断最终 JSON
 - 科学性分支新增 RoBERTa 分析文本编码，以及论文思路对应的 IFG + residual 融合
 - 元数据加载会排除同一 `video_id` 标签互相冲突的样本，并按 `video_id` 去重，防止训练/验证泄漏
 - `seed` 与 `split_seed` 已拆分，可在固定验证集上独立评估初始化稳定性
@@ -390,42 +390,39 @@ python inference/full_infer.py \
 当前数据状态：
 
 ```text
-唯一特征文件：379
-DeepSeek 有效缓存：379/379
-Whisper audio / DNSMOS / WPM / speech rhythm / 两套 LLM 分析向量：379/379
-去重并排除冲突标签后参与训练：342（正类 33，负类 309）
+筛选 CSV：692 行（正类 183，负类 509）
+唯一视频：629 个
+排除 14 个标签冲突 ID，并合并同 ID 重复标注后：615 个（正类 164，负类 451）
+唯一特征文件：652（含 37 个清洗元数据外的历史文件）
+实际训练覆盖：615/615（正类 164，负类 451）
+DeepSeek 有效缓存：652/652
+Whisper audio / DNSMOS / WPM / speech rhythm / 两套 LLM 分析向量：615/615
+COVER 官方三分支特征：615/615
 ```
 
-另有 20 个当前未参与训练的特征文件缺少 `aes_feat`。
+2026-08-18 已断点补齐原先缺失的 273 个训练样本。`tools/check_features.py` 检查 615 个训练文件后，
+所有字段维度、有限值和 COVER 版本均通过。另有 37 个历史特征文件不属于清洗后的训练元数据，训练时自动排除。
 
 ## 10. 科学性实验结果
 
-以下结果使用同一数据划分（`split_seed=42`）、全局 pair、focal ranking loss、`seed=42`。
-除学习率搜索外，消融学习率均为 `5e-5`：
+以下结果使用完整 615 个视频、同一数据划分（`split_seed=42`）、全局 pair、`seed=42` 和 `lr=5e-5`：
 
 | 科学性方案 | 验证 pairwise Acc / AUC |
 |---|---:|
-| 无 LLM | 0.6728 |
-| 仅 4 维 LLM 评分 | 0.6751 |
-| 仅最终分析文本 RoBERTa 向量，直接拼接 | **0.7558** |
-| 最终分析向量 + 4 维评分，直接拼接 | 0.7396 |
-| 推理全文 + 最终分析 + 评分，直接拼接 | 0.7212 |
-| 最终分析向量 + 评分，IFG | 0.6659 |
-| 推理全文 + 最终分析 + 评分，IFG | 0.6682 |
-| 推理全文 + 评分 + 手工科学特征，完整 IFG | 0.6912 |
+| 无 LLM | 0.7721 |
+| 仅 4 维 LLM 评分 | 0.7663 |
+| 仅最终分析文本 RoBERTa 向量，直接拼接 | 0.7923 |
+| 最终分析向量 + 4 维评分，直接拼接 | 0.7859 |
+| **推理全文 + 最终分析 + 评分，直接拼接** | **0.8091** |
+| 最终分析向量 + 评分，IFG | 0.7852 |
+| 推理全文 + 最终分析 + 评分，IFG | 0.8020 |
+| 推理全文 + 评分 + 手工科学特征，完整 IFG | 0.8051 |
 
-对最佳结构搜索学习率后，`lr=1e-5` 在 seed 42 达到 **0.7926**（第 8 轮），
-对应 checkpoint 为 `outputs/checkpoints/best_llm_optimized.pt`。
+最佳训练目标为 RankNet + pointwise calibration。加入 20% 分支权重下限后，seed 42 达到 **0.8438**，
+三种子均值为 `0.7987 +/- 0.0377`。该约束避免 learned fusion 完全塌缩到科学分支，同时保留了最佳性能。
 
-修复 faster-whisper encoder 接口并补齐真实 `audio_feat` 后，同配置启用音频得到 0.7857，
-显式禁用音频仍复现 0.7926；无 LLM 基线启用音频由 0.6728 提升到 0.6843。因此音频表示对基础模型
-有一定帮助，但没有提升当前 LLM 最佳组合。默认最佳 checkpoint 保存 `use_audio_feature=false`，
-启用音频的候选模型保存为 `outputs/checkpoints/best_llm_with_audio.pt`。
-
-结论：参考论文的“LLM 知识增强”思路可行，但当前数据上不应直接照搬 IFG。效果最好的做法是仅编码
-DeepSeek 的最终结构化分析文本并直接拼接；显式评分、完整推理文本和 IFG 都会降低单次实验指标。
-3-seed 固定划分复验仍有较大方差；`5e-5` 下分析方案均值为 0.6605，无 LLM 均值为 0.6536，
-因此论文中应把 0.7926 表述为固定划分最佳结果，而不是稳定显著提升。
+最终主模型为 `outputs/checkpoints/best_full_dataset_balanced.pt`；完整实验解释见
+`EXPERIMENT_RESULTS_FULL_DATASET.md`。
 
 完整结果位于：
 
@@ -433,9 +430,11 @@ DeepSeek 的最终结构化分析文本并直接拼接；显式评分、完整�
 outputs/logs/feature_diagnostics.json
 outputs/logs/feature_diagnostics_with_audio.json
 outputs/logs/science_ablation.json
+outputs/logs/cover_ablation.json
+outputs/logs/cover_ablation_multiseed.json
+outputs/logs/branch_floor_multiseed.json
 outputs/checkpoints/science_ablation/
-outputs/checkpoints/science_fixed_split/
-outputs/checkpoints/science_lr_stability/
+outputs/checkpoints/cover_ablation/
 ```
 
 ## 11. 常见问题

@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_native_clip", action="store_true")
     parser.add_argument("--disable_cross_gating", action="store_true")
     parser.add_argument("--fusion_mode", choices=["learned", "average"], default=CFG.fusion_mode)
+    parser.add_argument(
+        "--branch_weight_floor",
+        type=float,
+        default=CFG.branch_weight_floor,
+        help="Minimum learned fusion weight assigned to each quality branch.",
+    )
     parser.add_argument("--margin", type=float, default=CFG.margin)
     parser.add_argument("--same_category", action="store_true", default=CFG.same_category_pair)
     parser.add_argument(
@@ -65,12 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loss_type",
         choices=["ranknet", "focal", "weighted", "margin"],
-        default="focal" if CFG.use_focal_ranking else "weighted",
+        default="ranknet",
     )
     parser.add_argument("--early_stop_patience", type=int, default=CFG.early_stop_patience)
     parser.add_argument("--lambda_supervision", type=float, default=CFG.lambda_supervision)
     parser.add_argument("--lambda_consistency", type=float, default=0.1)
-    parser.add_argument("--lambda_pointwise", type=float, default=0.0)
+    parser.add_argument("--lambda_pointwise", type=float, default=0.1)
     parser.add_argument("--branch_pretrain_epochs", type=int, default=0)
     parser.add_argument("--branch_pretrain_supervision", type=float, default=1.0)
     parser.add_argument("--pos_weight", type=float, default=CFG.pos_weight)
@@ -90,7 +96,7 @@ def parse_args() -> argparse.Namespace:
             "analysis_scores_ifg",
             "full_ifg",
         ],
-        default="full_ifg",
+        default="analysis_scores_concat",
     )
     parser.add_argument(
         "--llm_text_source",
@@ -351,9 +357,37 @@ def main() -> None:
     def _filter_with_features(metadata_df, feature_dir: str | Path):
         feature_dir = Path(feature_dir)
         available = {p.stem for p in feature_dir.glob("*.pt")}
-        filtered = metadata_df[metadata_df["video_id"].astype(str).isin(available)].copy()
+        metadata_ids = metadata_df["video_id"].astype(str)
+        has_features = metadata_ids.isin(available)
+        filtered = metadata_df[has_features].copy()
         if filtered.empty:
             raise ValueError("No metadata rows have matching feature files.")
+
+        missing = metadata_df[~has_features]
+        coverage = len(filtered) / len(metadata_df)
+        filtered_labels = filtered["label"].value_counts().sort_index().to_dict()
+        missing_labels = missing["label"].value_counts().sort_index().to_dict()
+        logger.info(
+            "Training feature coverage: %d/%d (%.1f%%) | labels=%s | feature_files=%d",
+            len(filtered),
+            len(metadata_df),
+            coverage * 100.0,
+            filtered_labels,
+            len(available),
+        )
+        if not missing.empty:
+            logger.warning(
+                "Excluded %d metadata videos without feature files | labels=%s. "
+                "Run pipeline/run_pipeline.py to resume feature extraction.",
+                len(missing),
+                missing_labels,
+            )
+        orphan_count = len(available - set(metadata_ids))
+        if orphan_count:
+            logger.warning(
+                "Feature directory contains %d files outside the cleaned training metadata.",
+                orphan_count,
+            )
         return filtered
 
     try:
@@ -419,12 +453,13 @@ def main() -> None:
     if args.use_native_clip:
         model_config["video_dim"] = CFG.clip_video_dim
     model_config["fusion_mode"] = args.fusion_mode
+    model_config["branch_weight_floor"] = args.branch_weight_floor
     if args.disable_cross_gating:
         model_config["use_cross_gating"] = False
     model = MultiModalQualityModel(**model_config).to(device)
     use_audio_feature = not args.disable_audio
     logger.info(
-        "Science feature mode=%s | llm_text_source=%s | knowledge_gate=%s | audio=%s | cover=%s | native_clip=%s | fusion=%s | cross_gate=%s",
+        "Science feature mode=%s | llm_text_source=%s | knowledge_gate=%s | audio=%s | cover=%s | native_clip=%s | fusion=%s | branch_floor=%.2f | cross_gate=%s",
         args.science_feature_mode,
         args.llm_text_source,
         model_config["use_knowledge_gate"],
@@ -432,6 +467,7 @@ def main() -> None:
         args.use_cover_features,
         args.use_native_clip,
         args.fusion_mode,
+        args.branch_weight_floor,
         model_config["use_cross_gating"],
     )
     pretrain_branches(

@@ -65,7 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-text-source", choices=["analysis", "reasoning_and_analysis"], default="reasoning_and_analysis")
     parser.add_argument("--llm-cache-only", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--video-id", default="", help="Process one exact video id")
+    parser.add_argument(
+        "--video-id",
+        action="append",
+        dest="video_ids",
+        help="Process an exact video ID; repeat to process multiple samples.",
+    )
     parser.add_argument("--force", action="store_true", help="Recompute selected feature fields")
     parser.add_argument("--force-transcripts", action="store_true")
     parser.add_argument("--report", type=Path, default=CFG.log_dir / "feature_backfill_report.json")
@@ -116,10 +121,13 @@ def main() -> None:
     if "cover" in selected:
         effective_ids = set(load_metadata(args.metadata)["video_id"].astype(str))
         feature_paths = [path for path in feature_paths if path.stem in effective_ids]
-    if args.video_id:
-        feature_paths = [path for path in feature_paths if path.stem == str(args.video_id)]
-        if not feature_paths:
-            raise FileNotFoundError(f"Feature file not found for video id: {args.video_id}")
+    if args.video_ids:
+        requested_ids = {str(video_id).strip() for video_id in args.video_ids}
+        available_ids = {path.stem for path in feature_paths}
+        missing_ids = sorted(requested_ids - available_ids)
+        if missing_ids:
+            raise FileNotFoundError(f"Feature files not found for video IDs: {missing_ids}")
+        feature_paths = [path for path in feature_paths if path.stem in requested_ids]
     if args.limit > 0:
         feature_paths = feature_paths[: args.limit]
 

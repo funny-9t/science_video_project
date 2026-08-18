@@ -113,9 +113,45 @@ def main() -> None:
         metadata = load_metadata(CFG.metadata_csv)
         row_map = {str(row.video_id): row.to_dict() for _, row in metadata.iterrows()}
 
-        videos = list_videos(CFG.video_dir)
-        if not videos:
+        all_videos = list_videos(CFG.video_dir)
+        if not all_videos:
             raise FileNotFoundError(f"No video files found in: {CFG.video_dir}")
+
+        video_by_id: dict[str, Path] = {}
+        duplicate_video_files = 0
+        for video_path in all_videos:
+            video_id = get_video_id(video_path)
+            if video_id in video_by_id:
+                duplicate_video_files += 1
+                continue
+            video_by_id[video_id] = video_path
+
+        matched_ids = [video_id for video_id in row_map if video_id in video_by_id]
+        missing_video_ids = set(row_map) - set(video_by_id)
+        existing_ids = {
+            video_id
+            for video_id in matched_ids
+            if (CFG.feature_dir / f"{video_id}.pt").exists()
+        }
+        process_ids = (
+            [video_id for video_id in matched_ids if video_id not in existing_ids]
+            if CFG.skip_existing
+            else matched_ids
+        )
+        videos = [video_by_id[video_id] for video_id in process_ids]
+        logger.info(
+            "Feature extraction coverage: metadata=%d | matched_videos=%d | "
+            "existing=%d | pending=%d | files_on_disk=%d",
+            len(row_map),
+            len(matched_ids),
+            len(existing_ids),
+            len(matched_ids) - len(existing_ids),
+            len(all_videos),
+        )
+        if missing_video_ids:
+            logger.warning("Metadata videos missing on disk: %d", len(missing_video_ids))
+        if duplicate_video_files:
+            logger.warning("Duplicate video files sharing a video ID: %d", duplicate_video_files)
 
         meta_builder = MetaFeatureBuilder(categories=metadata["category"].tolist(), out_dim=CFG.meta_dim)
         if CFG.ffmpeg_path:
@@ -161,17 +197,7 @@ def main() -> None:
 
         for video_path in tqdm(videos, desc="Extracting features"):
             video_id = get_video_id(video_path)
-            if video_id not in row_map:
-                skipped += 1
-                logger.warning("Skip %s: not found in metadata", video_id)
-                continue
-
             out_pt = CFG.feature_dir / f"{video_id}.pt"
-            if CFG.skip_existing and out_pt.exists():
-                skipped += 1
-                logger.info("Skip %s: feature exists", video_id)
-                continue
-
             row = row_map[video_id]
             wav_path = CFG.audio_dir / f"{video_id}.wav"
             frame_path = CFG.frame_dir / video_id

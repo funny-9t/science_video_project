@@ -71,7 +71,7 @@ class LLMKnowledgeExtractor:
         max_retries: int = 3,
         retry_delay: float = 2.0,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         max_input_chars: int = 12000,
         reasoning_effort: str = "high",
         request_timeout: float = 90.0,
