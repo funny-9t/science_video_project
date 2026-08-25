@@ -57,6 +57,7 @@ class PairwiseVideoDataset(Dataset):
         deterministic_pairs: bool = False,
         use_native_clip: bool = False,
         use_cover_features: bool = False,
+        aesthetic_feature_backend: str = "legacy",
     ) -> "PairwiseVideoDataset":
         feature_dir = Path(feature_dir)
         samples = []
@@ -71,6 +72,24 @@ class PairwiseVideoDataset(Dataset):
                 if native.shape != (768,):
                     raise ValueError(f"Missing native CLIP feature for {video_id}: {native.shape}")
                 sample["video_feat"] = native
+            if aesthetic_feature_backend == "shared_clip":
+                from pipeline.step_aesthetic_clip import SharedCLIPAestheticScorer
+
+                shared_aesthetic = np.asarray(
+                    sample.get("aes_shared_clip_feat", []), dtype=np.float32
+                )
+                version = sample.get("aes_shared_clip_version", "")
+                if shared_aesthetic.shape != (7,) or not np.isfinite(shared_aesthetic).all():
+                    raise ValueError(
+                        f"Missing shared CLIP aesthetic feature for {video_id}: "
+                        f"{shared_aesthetic.shape}"
+                    )
+                if version != SharedCLIPAestheticScorer.FEATURE_VERSION:
+                    raise ValueError(
+                        f"Stale shared aesthetic feature for {video_id}: {version!r}; "
+                        f"expected {SharedCLIPAestheticScorer.FEATURE_VERSION!r}"
+                    )
+                sample["aes_feat"] = shared_aesthetic
             if use_cover_features:
                 from pipeline.step_cover import COVERFeatureExtractor
 

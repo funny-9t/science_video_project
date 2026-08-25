@@ -46,7 +46,9 @@ def build_model_config_from_cfg(cfg: Any) -> dict[str, Any]:
         "use_cover_features": bool(cfg.use_cover_features),
         "fusion_mode": str(cfg.fusion_mode),
         "branch_weight_floor": float(getattr(cfg, "branch_weight_floor", 0.0)),
+        "technical_feature_mode": str(getattr(cfg, "technical_feature_mode", "full")),
         "use_knowledge_gate": bool(cfg.use_knowledge_gate),
+        "science_fusion_mode": str(getattr(cfg, "science_fusion_mode", "concat")),
         "hidden_dim": int(cfg.hidden_dim),
         "use_cross_gating": bool(cfg.use_cross_gating),
         "cross_gating_dropout": float(cfg.cross_gating_dropout),
@@ -56,8 +58,18 @@ def build_model_config_from_cfg(cfg: Any) -> dict[str, Any]:
 def merge_checkpoint_model_config(ckpt: Any, default_config: dict[str, Any]) -> dict[str, Any]:
     """Use saved config when present, falling back to current CFG for old checkpoints."""
     merged = dict(default_config)
-    if isinstance(ckpt, dict) and isinstance(ckpt.get("config"), dict):
-        merged.update(ckpt["config"])
+    saved_config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    if isinstance(saved_config, dict):
+        merged.update(saved_config)
+        if "science_fusion_mode" not in saved_config:
+            merged["science_fusion_mode"] = (
+                "ifg" if saved_config.get("use_knowledge_gate", True) else "concat"
+            )
+        if "technical_feature_mode" not in saved_config:
+            training_config = ckpt.get("training_config", {})
+            merged["technical_feature_mode"] = str(
+                training_config.get("technical_feature_mode", "full")
+            )
     return merged
 
 

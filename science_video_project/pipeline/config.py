@@ -88,7 +88,9 @@ class Config:
     use_cover_features: bool = False            # frozen COVER priors for visual branches
     fusion_mode: str = "learned"               # learned | average
     branch_weight_floor: float = 0.2            # preserve technical/aesthetic branches in learned fusion
-    use_knowledge_gate: bool = True             # IFG for RoBERTa semantics and LLM knowledge
+    technical_feature_mode: str = "full_no_dnsmos"
+    use_knowledge_gate: bool = False            # IFG remains available through legacy/ablation modes
+    science_fusion_mode: str = "concat"         # concat for main_v2; ifg for ablation
 
     # loss weights
     lambda_consistency: float = 0.2

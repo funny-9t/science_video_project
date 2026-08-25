@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pipeline.config import CFG
 from pipeline.step_audio import AudioEncoder
+from pipeline.step_aesthetic_clip import SharedCLIPAestheticScorer
 from pipeline.step_dnsmos import DNSMOSScorer
 from pipeline.step_llm_knowledge import (
     LLMKnowledgeExtractor,
@@ -40,14 +41,16 @@ from pipeline.step_video import VideoEncoder
 from pipeline.utils_io import get_video_id, list_videos, load_metadata
 
 
-VALID_FEATURES = {"audio", "speech", "dnsmos", "llm", "clip", "cover"}
+VALID_FEATURES = {
+    "audio", "speech", "dnsmos", "llm", "clip", "shared_aesthetic", "cover"
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--features", default="speech,dnsmos",
-        help="Comma-separated: audio,speech,dnsmos,llm,clip,cover",
+        help="Comma-separated: audio,speech,dnsmos,llm,clip,shared_aesthetic,cover",
     )
     parser.add_argument("--feature-dir", type=Path, default=CFG.feature_dir)
     parser.add_argument("--audio-dir", type=Path, default=CFG.audio_dir)
@@ -157,12 +160,20 @@ def main() -> None:
             model=args.llm_model,
             api_base=CFG.llm_api_base,
             cache_dir=CFG.llm_cache_dir,
+            cache_policy="require" if args.llm_cache_only else "prefer",
         )
         analysis_encoder = RobertaAnalysisEncoder(CFG.text_model_name, device=CFG.device)
 
     video_encoder = None
     if "clip" in selected:
         video_encoder = VideoEncoder(CFG.clip_model_name, CFG.device)
+
+    shared_aesthetic = None
+    if "shared_aesthetic" in selected:
+        shared_aesthetic = SharedCLIPAestheticScorer(
+            CFG.clip_model_name,
+            device=CFG.device,
+        )
 
     cover_extractor = None
     video_map = {}
@@ -231,6 +242,36 @@ def main() -> None:
                         f"global_uniform_{CFG.clip_max_frames}_v1"
                     )
                     changed = True
+
+            if "shared_aesthetic" in selected and (
+                args.force
+                or "aes_shared_clip_feat" not in sample
+                or sample.get("aes_shared_clip_version")
+                != SharedCLIPAestheticScorer.FEATURE_VERSION
+            ):
+                frame_features = np.asarray(sample.get("frame_features", []), dtype=np.float32)
+                if frame_features.ndim != 2 or frame_features.shape[-1] != CFG.clip_video_dim:
+                    frame_dir = args.frame_dir / video_id
+                    if not frame_dir.exists() or not any(frame_dir.glob("*.jpg")):
+                        raise FileNotFoundError(f"frame images missing: {frame_dir}")
+                    if video_encoder is None:
+                        video_encoder = VideoEncoder(CFG.clip_model_name, CFG.device)
+                    encoded = video_encoder.encode_frame_features(
+                        frame_dir, max_frames=CFG.clip_max_frames
+                    )
+                    frame_features = encoded.numpy()
+                    sample["frame_features"] = frame_features
+                    sample["clip_video_feat"] = encoded.mean(dim=0).numpy()
+                    sample["clip_sampling_version"] = (
+                        f"global_uniform_{CFG.clip_max_frames}_v1"
+                    )
+                aes_result = shared_aesthetic.score_frame_features(frame_features)
+                sample["aes_shared_clip_feat"] = np.asarray(
+                    [aes_result["dimensions"][item["name"]] for item in shared_aesthetic.prompts],
+                    dtype=np.float32,
+                )
+                sample["aes_shared_clip_version"] = SharedCLIPAestheticScorer.FEATURE_VERSION
+                changed = True
 
             if "audio" in selected and needs_field(sample, "audio_feat", args.force):
                 sample["audio_feat"] = audio_encoder.encode(str(wav_path)).numpy()

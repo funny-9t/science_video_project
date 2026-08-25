@@ -187,6 +187,8 @@ def main() -> None:
                 "--seed", str(seed),
                 "--split_seed", str(args.split_seed),
                 "--pair_scope", "global",
+                "--technical_feature_mode", "full",
+                "--aesthetic_feature_backend", "legacy",
                 "--science_feature_mode", args.science_feature_mode,
                 "--llm_text_source", args.llm_text_source,
                 "--checkpoint", str(checkpoint),

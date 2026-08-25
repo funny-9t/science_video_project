@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline.config import CFG
+from pipeline.profiles import PROFILES, get_profile
 from pipeline.utils_io import ensure_dir, load_metadata
 from training.dataloader_pair import collate_pair
 from training.dataset_pair import PairwiseVideoDataset
@@ -42,6 +43,7 @@ from training.utils_train import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train pairwise ranking model for science video quality")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="main_v2")
     parser.add_argument("--metadata", default=str(CFG.metadata_csv))
     parser.add_argument("--feature_dir", default=str(CFG.feature_dir))
     parser.add_argument("--epochs", type=int, default=CFG.epochs)
@@ -52,6 +54,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_audio", action="store_true")
     parser.add_argument("--use_cover_features", action="store_true")
     parser.add_argument("--use_native_clip", action="store_true")
+    parser.add_argument(
+        "--aesthetic_feature_backend",
+        choices=["legacy", "shared_clip"],
+        default=None,
+    )
+    parser.add_argument(
+        "--technical_feature_mode",
+        choices=["full", "full_no_dnsmos", "visual_only", "visual_dnsmos", "dnsmos_only"],
+        default=None,
+        help="Inputs visible to the technical branch; other model branches remain unchanged.",
+    )
     parser.add_argument("--disable_cross_gating", action="store_true")
     parser.add_argument("--fusion_mode", choices=["learned", "average"], default=CFG.fusion_mode)
     parser.add_argument(
@@ -96,7 +109,7 @@ def parse_args() -> argparse.Namespace:
             "analysis_scores_ifg",
             "full_ifg",
         ],
-        default="analysis_scores_concat",
+        default=None,
     )
     parser.add_argument(
         "--llm_text_source",
@@ -104,7 +117,22 @@ def parse_args() -> argparse.Namespace:
         default="reasoning_and_analysis",
     )
     parser.add_argument("--checkpoint", default=str(CFG.checkpoint_dir / "best.pt"))
-    return parser.parse_args()
+    args = parser.parse_args()
+    profile = get_profile(args.profile)
+    if args.technical_feature_mode is None:
+        args.technical_feature_mode = profile.technical_feature_mode
+    if args.aesthetic_feature_backend is None:
+        args.aesthetic_feature_backend = profile.aesthetic_backend
+        if args.aesthetic_feature_backend == "separate_clip":
+            args.aesthetic_feature_backend = "legacy"
+    if args.science_feature_mode is None:
+        args.science_feature_mode = (
+            "full_ifg" if profile.science_fusion_mode == "ifg"
+            else "analysis_scores_concat"
+        )
+    if profile.use_cover:
+        args.use_cover_features = True
+    return args
 
 
 def configure_science_features(
@@ -418,6 +446,7 @@ def main() -> None:
         deterministic_pairs=False,
         use_native_clip=args.use_native_clip,
         use_cover_features=args.use_cover_features,
+        aesthetic_feature_backend=args.aesthetic_feature_backend,
     )
     val_ds = PairwiseVideoDataset.from_metadata(
         val_df,
@@ -426,6 +455,7 @@ def main() -> None:
         deterministic_pairs=True,
         use_native_clip=args.use_native_clip,
         use_cover_features=args.use_cover_features,
+        aesthetic_feature_backend=args.aesthetic_feature_backend,
     )
 
     train_loader = DataLoader(
@@ -449,20 +479,26 @@ def main() -> None:
         "analysis_concat",
         "analysis_scores_concat",
     }
+    model_config["science_fusion_mode"] = (
+        "ifg" if model_config["use_knowledge_gate"] else "concat"
+    )
     model_config["use_cover_features"] = args.use_cover_features
     if args.use_native_clip:
         model_config["video_dim"] = CFG.clip_video_dim
     model_config["fusion_mode"] = args.fusion_mode
     model_config["branch_weight_floor"] = args.branch_weight_floor
+    model_config["technical_feature_mode"] = args.technical_feature_mode
     if args.disable_cross_gating:
         model_config["use_cross_gating"] = False
     model = MultiModalQualityModel(**model_config).to(device)
     use_audio_feature = not args.disable_audio
     logger.info(
-        "Science feature mode=%s | llm_text_source=%s | knowledge_gate=%s | audio=%s | cover=%s | native_clip=%s | fusion=%s | branch_floor=%.2f | cross_gate=%s",
+        "Science feature mode=%s | llm_text_source=%s | knowledge_gate=%s | technical=%s | aesthetic=%s | audio=%s | cover=%s | native_clip=%s | fusion=%s | branch_floor=%.2f | cross_gate=%s",
         args.science_feature_mode,
         args.llm_text_source,
         model_config["use_knowledge_gate"],
+        args.technical_feature_mode,
+        args.aesthetic_feature_backend,
         use_audio_feature,
         args.use_cover_features,
         args.use_native_clip,
@@ -703,6 +739,9 @@ def main() -> None:
                         "seed": args.seed,
                         "split_seed": args.split_seed,
                         "use_audio_feature": use_audio_feature,
+                        "technical_feature_mode": args.technical_feature_mode,
+                        "aesthetic_feature_backend": args.aesthetic_feature_backend,
+                        "profile": args.profile,
                         "use_native_clip": args.use_native_clip,
                         "use_cover_features": args.use_cover_features,
                         "use_cross_gating": model_config["use_cross_gating"],

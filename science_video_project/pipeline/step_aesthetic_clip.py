@@ -21,10 +21,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import clip
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from transformers import CLIPTextModelWithProjection, CLIPTokenizerFast
+
+try:
+    import clip
+except ImportError:
+    clip = None
+
+
+SHARED_AESTHETIC_VERSION = "shared_clip_vitl14_prompts_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +127,11 @@ class CLIPAestheticScorer:
         self.batch_size = batch_size
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
 
+        if clip is None:
+            raise RuntimeError(
+                "The legacy aesthetic scorer requires the openai-clip package. "
+                "Use SharedCLIPAestheticScorer with the local ViT-L/14 model."
+            )
         print(f"[CLIPAestheticScorer] Loading CLIP model: {clip_model_name}")
         self.model, self.preprocess = clip.load(clip_model_name, device=self.device)
         self.model.eval()
@@ -231,52 +244,120 @@ class CLIPAestheticScorer:
         frame_dir: str | Path,
         aggregation: str = "mean",
     ) -> dict:
-        """Batched version — loads frames in batches for GPU efficiency."""
+        """Encode frame images in batches with the legacy aesthetic CLIP."""
         frame_paths = sorted(Path(frame_dir).glob("*.jpg"))
         if not frame_paths:
             raise FileNotFoundError(f"No .jpg frames found in {frame_dir}")
 
-        # Preprocess all images
         all_imgs = []
         for fp in frame_paths:
-            img = Image.open(fp).convert("RGB")
-            all_imgs.append(self.preprocess(img))
+            with Image.open(fp) as image:
+                all_imgs.append(self.preprocess(image.convert("RGB")))
 
-        # Batched encoding
         all_feats: list[torch.Tensor] = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for i in range(0, len(all_imgs), self.batch_size):
                 batch = torch.stack(all_imgs[i: i + self.batch_size]).to(self.device)
                 feats = self.model.encode_image(batch)
                 all_feats.append(F.normalize(feats, dim=-1))
 
-        img_feats = torch.cat(all_feats, dim=0)  # (N, dim)
-
-        # Compute dimension scores
-        pos_all = torch.cat(self._pos_text_feats, dim=0)  # (D, dim)
-        neg_all = torch.cat(self._neg_text_feats, dim=0)  # (D, dim)
-
-        sim_pos = img_feats @ pos_all.T  # (N, D)
-        sim_neg = img_feats @ neg_all.T  # (N, D)
-        delta = sim_pos - sim_neg  # (N, D)
-
-        # Aggregate
+        img_feats = torch.cat(all_feats, dim=0)
+        pos_all = torch.cat(self._pos_text_feats, dim=0)
+        neg_all = torch.cat(self._neg_text_feats, dim=0)
+        delta = img_feats @ pos_all.T - img_feats @ neg_all.T
         if aggregation == "mean":
-            agg = delta.mean(dim=0)  # (D,)
+            aggregated = delta.mean(dim=0)
         elif aggregation == "median":
-            agg = delta.median(dim=0).values
+            aggregated = delta.median(dim=0).values
         else:
             raise ValueError(f"Unsupported aggregation: {aggregation}")
 
-        dim_scores = {name: float(agg[i]) for i, name in enumerate(self._prompt_names)}
-        aesthetic_score = float(agg.mean())
-
+        dimensions = {
+            name: float(aggregated[index])
+            for index, name in enumerate(self._prompt_names)
+        }
         return {
-            "aesthetic_score": aesthetic_score,
-            "dimensions": dim_scores,
+            "aesthetic_score": float(aggregated.mean()),
+            "dimensions": dimensions,
             "num_frames": len(frame_paths),
         }
 
+
+class SharedCLIPAestheticScorer:
+    """Prompt scorer operating directly on cached ViT-L/14 frame embeddings."""
+
+    FEATURE_VERSION = SHARED_AESTHETIC_VERSION
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        prompts: list[dict] | None = None,
+        device: str = "cuda",
+    ):
+        self.prompts = prompts or DEFAULT_PROMPTS
+        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        model_path = str(model_path)
+        tokenizer = CLIPTokenizerFast.from_pretrained(model_path, local_files_only=True)
+        text_model = CLIPTextModelWithProjection.from_pretrained(
+            model_path,
+            local_files_only=True,
+        ).to(self.device)
+        text_model.eval()
+        if self.device.type == "cuda":
+            text_model = text_model.to(dtype=self.dtype)
+
+        positive = [item["positive"] for item in self.prompts]
+        negative = [item["negative"] for item in self.prompts]
+        tokens = tokenizer(
+            positive + negative,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt",
+        )
+        tokens = {key: value.to(self.device) for key, value in tokens.items()}
+        with torch.inference_mode():
+            text_features = text_model(**tokens).text_embeds
+            text_features = F.normalize(text_features, dim=-1)
+        split = len(self.prompts)
+        self.positive_features = text_features[:split].detach()
+        self.negative_features = text_features[split:].detach()
+        self.prompt_names = [item["name"] for item in self.prompts]
+        del text_model
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def score_frame_features(
+        self,
+        frame_features: torch.Tensor,
+        aggregation: str = "mean",
+    ) -> dict:
+        features = torch.as_tensor(frame_features, dtype=self.dtype, device=self.device)
+        if features.ndim != 2 or features.shape[-1] != self.positive_features.shape[-1]:
+            raise ValueError(
+                f"Expected frame features shaped (N, {self.positive_features.shape[-1]}), "
+                f"got {tuple(features.shape)}"
+            )
+        features = F.normalize(features, dim=-1)
+        delta = features @ self.positive_features.T - features @ self.negative_features.T
+        if aggregation == "mean":
+            aggregated = delta.mean(dim=0)
+        elif aggregation == "median":
+            aggregated = delta.median(dim=0).values
+        else:
+            raise ValueError(f"Unsupported aggregation: {aggregation}")
+        aggregated = aggregated.detach().cpu().float()
+        dimensions = {
+            name: float(aggregated[index])
+            for index, name in enumerate(self.prompt_names)
+        }
+        return {
+            "aesthetic_score": float(aggregated.mean()),
+            "dimensions": dimensions,
+            "num_frames": int(features.shape[0]),
+            "feature_version": self.FEATURE_VERSION,
+        }
 
 # ---------------------------------------------------------------------------
 #  Quick demo

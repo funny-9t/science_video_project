@@ -1,3 +1,4 @@
+import argparse
 import sys
 from pathlib import Path
 import numpy as np
@@ -9,11 +10,19 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline.config import CFG
-from pipeline.step_cover import COVERFeatureExtractor
+from pipeline.profiles import PROFILES, get_profile
 from pipeline.utils_io import load_metadata
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate extracted feature files")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="main_v2")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    profile = get_profile(args.profile)
     root = CFG.feature_dir
     expected = {
         "text_feat": 768,
@@ -27,8 +36,11 @@ def main() -> None:
         "sci_hand_feat": 5,
         "llm_knowledge_feat": 4,
         "llm_analysis_feat": 768,
-        "cover_feat": 3,
     }
+    if profile.use_cover:
+        expected["cover_feat"] = 3
+    if profile.aesthetic_backend == "shared_clip":
+        expected["aes_shared_clip_feat"] = 7
 
     effective_ids = set(load_metadata(CFG.metadata_csv)["video_id"].astype(str))
     files = sorted(path for path in root.glob("*.pt") if path.stem in effective_ids)
@@ -49,9 +61,18 @@ def main() -> None:
                 bad.append((path.name, key, f"{got} != {dim}"))
             elif not np.isfinite(np.asarray(value)).all():
                 bad.append((path.name, key, "contains non-finite values"))
-        cover_version = sample.get("cover_feature_version", "")
-        if cover_version != COVERFeatureExtractor.FEATURE_VERSION:
-            bad.append((path.name, "cover_feature_version", repr(cover_version)))
+        if profile.use_cover:
+            from pipeline.step_cover import COVERFeatureExtractor
+
+            cover_version = sample.get("cover_feature_version", "")
+            if cover_version != COVERFeatureExtractor.FEATURE_VERSION:
+                bad.append((path.name, "cover_feature_version", repr(cover_version)))
+        if profile.aesthetic_backend == "shared_clip":
+            from pipeline.step_aesthetic_clip import SharedCLIPAestheticScorer
+
+            version = sample.get("aes_shared_clip_version", "")
+            if version != SharedCLIPAestheticScorer.FEATURE_VERSION:
+                bad.append((path.name, "aes_shared_clip_version", repr(version)))
         frame_features = sample.get("frame_features")
         if frame_features is None or getattr(frame_features, "ndim", 0) != 2:
             bad.append((path.name, "frame_features", "missing or not 2D"))

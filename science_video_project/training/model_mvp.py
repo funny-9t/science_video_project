@@ -59,12 +59,18 @@ class ScientificBranch(nn.Module):
         llm_analysis_dim: int = 768,
         sci_hand_dim: int = 5,
         use_knowledge_gate: bool = True,
+        science_fusion_mode: str | None = None,
     ):
         super().__init__()
         self.llm_knowledge_dim = llm_knowledge_dim
         self.llm_analysis_dim = llm_analysis_dim
         self.sci_hand_dim = sci_hand_dim
-        self.use_knowledge_gate = use_knowledge_gate
+        self.science_fusion_mode = science_fusion_mode or (
+            "ifg" if use_knowledge_gate else "concat"
+        )
+        if self.science_fusion_mode not in {"concat", "ifg"}:
+            raise ValueError("science_fusion_mode must be 'concat' or 'ifg'.")
+        self.use_knowledge_gate = self.science_fusion_mode == "ifg"
         self.text_proj = MLPBlock(text_dim, hidden_dim, hidden_dim)
         self.meta_proj = MLPBlock(meta_dim, hidden_dim, hidden_dim)
         self.llm_score_proj = MLPBlock(llm_knowledge_dim, hidden_dim, hidden_dim)
@@ -146,10 +152,21 @@ class ScientificBranch(nn.Module):
 class TechnicalBranch(nn.Module):
     def __init__(self, video_dim: int, meta_dim: int, dnsmos_dim: int, wpm_dim: int,
                  rhythm_dim: int, hidden_dim: int, cover_dim: int = 3,
-                 use_cover_features: bool = False):
+                 use_cover_features: bool = False,
+                 feature_mode: str = "full"):
         super().__init__()
+        valid_modes = {
+            "full", "full_no_dnsmos", "visual_only", "visual_dnsmos", "dnsmos_only"
+        }
+        if feature_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported technical feature mode: {feature_mode!r}; "
+                f"expected one of {sorted(valid_modes)}"
+            )
         self.cover_dim = cover_dim
         self.use_cover_features = use_cover_features
+        self.feature_mode = feature_mode
+        self.hidden_dim = hidden_dim
         self.video_proj = MLPBlock(video_dim, hidden_dim, hidden_dim)
         self.meta_proj = MLPBlock(meta_dim, hidden_dim, hidden_dim)
         self.dnsmos_proj = MLPBlock(dnsmos_dim, hidden_dim, hidden_dim)
@@ -172,17 +189,24 @@ class TechnicalBranch(nn.Module):
         speech_rhythm_feat: torch.Tensor | None = None,
         cover_feat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        v = self.video_proj(video_feat)
-        m = self.meta_proj(meta_feat)
+        use_visual = self.feature_mode in {
+            "full", "full_no_dnsmos", "visual_only", "visual_dnsmos"
+        }
+        use_dnsmos = self.feature_mode in {"full", "visual_dnsmos", "dnsmos_only"}
+        use_context = self.feature_mode in {"full", "full_no_dnsmos"}
+
+        zero_hidden = video_feat.new_zeros(video_feat.size(0), self.hidden_dim)
+        v = self.video_proj(video_feat) if use_visual else zero_hidden
+        m = self.meta_proj(meta_feat) if use_context else zero_hidden
         if dnsmos_feat is None:
             dnsmos_feat = torch.zeros(video_feat.size(0), 3, device=video_feat.device, dtype=video_feat.dtype)
-        d = self.dnsmos_proj(dnsmos_feat)
+        d = self.dnsmos_proj(dnsmos_feat) if use_dnsmos else zero_hidden
         if wpm is None:
             wpm = torch.zeros(video_feat.size(0), 1, device=video_feat.device, dtype=video_feat.dtype)
-        wp = self.wpm_proj(wpm)
+        wp = self.wpm_proj(wpm) if use_context else zero_hidden
         if speech_rhythm_feat is None:
             speech_rhythm_feat = torch.zeros(video_feat.size(0), 6, device=video_feat.device, dtype=video_feat.dtype)
-        rh = self.rhythm_proj(speech_rhythm_feat)
+        rh = self.rhythm_proj(speech_rhythm_feat) if use_context else zero_hidden
         parts = [v, m, d, wp, rh]
         if self.use_cover_features and self.cover_proj is not None:
             if cover_feat is None:
@@ -245,10 +269,12 @@ class MultiModalQualityModel(nn.Module):
                  aes_dim: int = 7, dnsmos_dim: int = 3, wpm_dim: int = 1, rhythm_dim: int = 6,
                  llm_knowledge_dim: int = 4, llm_analysis_dim: int = 768,
                  sci_hand_dim: int = 5, use_knowledge_gate: bool = True,
+                 science_fusion_mode: str | None = None,
                  hidden_dim: int = 128,
                  use_cross_gating: bool = True, cross_gating_dropout: float = 0.1,
                  cover_dim: int = 3, use_cover_features: bool = False,
-                 fusion_mode: str = "learned", branch_weight_floor: float = 0.0):
+                 fusion_mode: str = "learned", branch_weight_floor: float = 0.0,
+                 technical_feature_mode: str = "full"):
         super().__init__()
         if fusion_mode not in {"learned", "average"}:
             raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
@@ -261,10 +287,12 @@ class MultiModalQualityModel(nn.Module):
                                                   llm_knowledge_dim=llm_knowledge_dim,
                                                   llm_analysis_dim=llm_analysis_dim,
                                                   sci_hand_dim=sci_hand_dim,
-                                                  use_knowledge_gate=use_knowledge_gate)
+                                                  use_knowledge_gate=use_knowledge_gate,
+                                                  science_fusion_mode=science_fusion_mode)
         self.technical_branch = TechnicalBranch(
             video_dim, meta_dim, dnsmos_dim, wpm_dim, rhythm_dim, hidden_dim,
             cover_dim=cover_dim, use_cover_features=use_cover_features,
+            feature_mode=technical_feature_mode,
         )
         self.aesthetic_branch = AestheticBranch(
             video_dim, text_dim, audio_dim, aes_dim, hidden_dim,
