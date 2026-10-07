@@ -26,13 +26,8 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPTextModelWithProjection, CLIPTokenizerFast
 
-try:
-    import clip
-except ImportError:
-    clip = None
-
-
 SHARED_AESTHETIC_VERSION = "shared_clip_vitl14_prompts_v1"
+A2_SHARED_AESTHETIC_VERSION = "shared_clip_vitl14_a2_domain_semantic_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +81,56 @@ DEFAULT_PROMPTS = [
 ]
 
 
+AESTHETIC_PROMPTS_A2 = [
+    {
+        "name": "composition",
+        "positive": "a video frame with refined and well-balanced composition",
+        "negative": "a video frame with poor and unbalanced composition",
+    },
+    {
+        "name": "color_harmony",
+        "positive": "a video frame with harmonious and visually pleasing colors",
+        "negative": "a video frame with disharmonious and visually unpleasant colors",
+    },
+    {
+        "name": "lighting",
+        "positive": "a video frame with balanced and aesthetically pleasing lighting",
+        "negative": "a video frame with unbalanced and aesthetically poor lighting",
+    },
+    {
+        "name": "visual_hierarchy",
+        "positive": "a video frame with a clear and well-organized visual hierarchy",
+        "negative": "a video frame with a confusing and disorganized visual hierarchy",
+    },
+    {
+        "name": "visual_presentation",
+        "positive": "a video frame with well-arranged and coherent visual presentation",
+        "negative": "a video frame with poorly arranged and confusing visual presentation",
+    },
+    {
+        "name": "visual_refinement",
+        "positive": "a polished video frame with refined visual details",
+        "negative": "a rough video frame with poorly handled visual details",
+    },
+    {
+        "name": "visual_appeal",
+        "positive": "a visually appealing and aesthetically pleasing video frame",
+        "negative": "a visually unappealing and aesthetically poor video frame",
+    },
+]
+
+
+AESTHETIC_PROMPT_SETS = {
+    "a1_original": DEFAULT_PROMPTS,
+    "a2_domain_semantic": AESTHETIC_PROMPTS_A2,
+}
+
+AESTHETIC_FEATURE_VERSIONS = {
+    "a1_original": SHARED_AESTHETIC_VERSION,
+    "a2_domain_semantic": A2_SHARED_AESTHETIC_VERSION,
+}
+
+
 # Shorter subset for fast prototyping
 QUICK_PROMPTS = [
     {
@@ -127,13 +172,16 @@ class CLIPAestheticScorer:
         self.batch_size = batch_size
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
 
-        if clip is None:
+        try:
+            import clip as openai_clip
+        except ImportError as exc:
             raise RuntimeError(
                 "The legacy aesthetic scorer requires the openai-clip package. "
                 "Use SharedCLIPAestheticScorer with the local ViT-L/14 model."
-            )
+            ) from exc
+        self._clip = openai_clip
         print(f"[CLIPAestheticScorer] Loading CLIP model: {clip_model_name}")
-        self.model, self.preprocess = clip.load(clip_model_name, device=self.device)
+        self.model, self.preprocess = self._clip.load(clip_model_name, device=self.device)
         self.model.eval()
 
         # Precompute text features for all prompts
@@ -158,7 +206,7 @@ class CLIPAestheticScorer:
     # ------------------------------------------------------------------
 
     def _encode_text(self, text: str) -> torch.Tensor:
-        tokens = clip.tokenize([text]).to(self.device)
+        tokens = self._clip.tokenize([text]).to(self.device)
         feat = self.model.encode_text(tokens)
         feat = F.normalize(feat, dim=-1)
         return feat  # (1, dim)
@@ -293,8 +341,16 @@ class SharedCLIPAestheticScorer:
         model_path: str | Path,
         prompts: list[dict] | None = None,
         device: str = "cuda",
+        prompt_version: str = "a1_original",
     ):
-        self.prompts = prompts or DEFAULT_PROMPTS
+        if prompt_version not in AESTHETIC_PROMPT_SETS:
+            raise ValueError(
+                f"Unknown aesthetic prompt version: {prompt_version!r}; "
+                f"expected one of {sorted(AESTHETIC_PROMPT_SETS)}"
+            )
+        self.prompt_version = prompt_version
+        self.prompts = prompts or AESTHETIC_PROMPT_SETS[prompt_version]
+        self.feature_version = AESTHETIC_FEATURE_VERSIONS[prompt_version]
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
         model_path = str(model_path)
@@ -356,7 +412,8 @@ class SharedCLIPAestheticScorer:
             "aesthetic_score": float(aggregated.mean()),
             "dimensions": dimensions,
             "num_frames": int(features.shape[0]),
-            "feature_version": self.FEATURE_VERSION,
+            "feature_version": self.feature_version,
+            "prompt_version": self.prompt_version,
         }
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,107 @@
+{
+  "variant": "a2_domain_semantic",
+  "seed": 42,
+  "split_seed": 42,
+  "validation_hash": "79413d21918a956716f230456b80aec037be51bfd1c6a412a8c0a30087a2a58f",
+  "train_size": 492,
+  "validation_size": 123,
+  "stage1": {
+    "accuracy": 0.2682926829268293,
+    "f1": 0.4230769230769231,
+    "auc": 0.7410774410774411,
+    "pr_auc": 0.429472815719342,
+    "ranking_accuracy": 0.7410774410774411,
+    "best_threshold": 0.1,
+    "overall_srcc": 0.3773458504046732,
+    "sci_srcc": 0.42490881852923096,
+    "tech_srcc": 0.302330465197764,
+    "aes_srcc": 0.2420429483445165,
+    "aes_plcc": 0.24787983820216192,
+    "aes_mse": 0.044478029012680054,
+    "aes_mae": 0.17309144139289856,
+    "branch_macro_srcc": 0.3230940773571705,
+    "science_weight": 0.32846930623054504,
+    "technical_weight": 0.331407755613327,
+    "aesthetic_weight": 0.3401229679584503,
+    "best_epoch": 9,
+    "checkpoint": "C:\\Users\\10465\\.codex\\worktrees\\1b6b\\science_video_ranker_mvp\\experiments\\aesthetic_prompt_a2\\training\\a2_domain_semantic\\seed_42\\stage1_best.pt"
+  },
+  "stage2": {
+    "accuracy": 0.7723577235772358,
+    "f1": 0.6410256410256411,
+    "auc": 0.8144781144781145,
+    "pr_auc": 0.6430488094721403,
+    "ranking_accuracy": 0.8144781144781145,
+    "best_threshold": 0.15000000000000002,
+    "overall_srcc": 0.4648712078216317,
+    "sci_srcc": 0.4755216721704713,
+    "tech_srcc": 0.23962221948741494,
+    "aes_srcc": 0.30192687561231085,
+    "aes_plcc": 0.2913760256894175,
+    "aes_mse": 0.04022425785660744,
+    "aes_mae": 0.1609112024307251,
+    "branch_macro_srcc": 0.3390235890900657,
+    "science_weight": 0.5977628231048584,
+    "technical_weight": 0.2011280506849289,
+    "aesthetic_weight": 0.2011091709136963,
+    "best_epoch": 12,
+    "checkpoint": "C:\\Users\\10465\\.codex\\worktrees\\1b6b\\science_video_ranker_mvp\\experiments\\aesthetic_prompt_a2\\training\\a2_domain_semantic\\seed_42\\stage2_best.pt"
+  },
+  "multi_seed_stage2": {
+    "seeds": [
+      42,
+      123,
+      2026
+    ],
+    "metrics": {
+      "aes_srcc": {
+        "mean": 0.2627029594176599,
+        "std": 0.03405933776044156
+      },
+      "aes_plcc": {
+        "mean": 0.25039812363013114,
+        "std": 0.039366665544371376
+      },
+      "aes_mse": {
+        "mean": 0.04180394858121872,
+        "std": 0.0014229490427539687
+      },
+      "aes_mae": {
+        "mean": 0.16317644715309143,
+        "std": 0.003061405361171086
+      },
+      "auc": {
+        "mean": 0.798989898989899,
+        "std": 0.01620364904446594
+      },
+      "pr_auc": {
+        "mean": 0.5969807365053953,
+        "std": 0.04235451928917509
+      },
+      "accuracy": {
+        "mean": 0.7723577235772359,
+        "std": 0.03252032520325204
+      },
+      "f1": {
+        "mean": 0.6257964257964258,
+        "std": 0.022461639739120035
+      },
+      "overall_srcc": {
+        "mean": 0.4096512723141828,
+        "std": 0.0512929157194339
+      },
+      "science_weight": {
+        "mean": 0.5143510301907858,
+        "std": 0.1375262937402564
+      },
+      "technical_weight": {
+        "mean": 0.24895923833052316,
+        "std": 0.07835196016665777
+      },
+      "aesthetic_weight": {
+        "mean": 0.23668978611628214,
+        "std": 0.059175788023391455
+      }
+    }
+  }
+}

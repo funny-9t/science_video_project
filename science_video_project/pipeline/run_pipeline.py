@@ -143,11 +143,17 @@ def main() -> None:
 
         matched_ids = [video_id for video_id in row_map if video_id in video_by_id]
         missing_video_ids = set(row_map) - set(video_by_id)
-        existing_ids = {
-            video_id
-            for video_id in matched_ids
-            if (CFG.feature_dir / f"{video_id}.pt").exists()
-        }
+        existing_ids = set()
+        for video_id in matched_ids:
+            feature_path = CFG.feature_dir / f"{video_id}.pt"
+            if not feature_path.exists():
+                continue
+            if profile.use_cover_technical:
+                sample = torch.load(feature_path, map_location="cpu", weights_only=False)
+                value = sample.get("cover_technical_feat")
+                if value is None or np.asarray(value).shape != (CFG.cover_technical_dim,):
+                    continue
+            existing_ids.add(video_id)
         process_ids = (
             [video_id for video_id in matched_ids if video_id not in existing_ids]
             if CFG.skip_existing and not args.force
@@ -164,10 +170,11 @@ def main() -> None:
             len(all_videos),
         )
         logger.info(
-            "Profile=%s | llm=%s | cover=%s | dnsmos=%s | aesthetic=%s",
+            "Profile=%s | llm=%s | cover=%s | cover_technical=%s | dnsmos=%s | aesthetic=%s",
             profile.name,
             profile.llm_cache_policy,
             profile.use_cover,
+            profile.use_cover_technical,
             profile.use_dnsmos,
             profile.aesthetic_backend,
         )
@@ -214,6 +221,14 @@ def main() -> None:
             from pipeline.step_cover import COVERFeatureExtractor
 
             cover_extractor = COVERFeatureExtractor(CFG.cover_root, device=CFG.device)
+
+        cover_technical_extractor = None
+        if profile.use_cover_technical:
+            from pipeline.step_cover_technical import COVERTechnicalFeatureExtractor
+
+            cover_technical_extractor = COVERTechnicalFeatureExtractor(
+                CFG.cover_root, device=CFG.device
+            )
 
         # ── §7+ LLM 知识科学性特征提取器 ──
         sci_hand_extractor = ScienceFeatureExtractor()
@@ -277,6 +292,11 @@ def main() -> None:
             cover_feat = (
                 cover_extractor.score(video_path)
                 if cover_extractor is not None
+                else None
+            )
+            cover_technical_feat = (
+                cover_technical_extractor.extract(video_path)
+                if cover_technical_extractor is not None
                 else None
             )
 
@@ -361,6 +381,14 @@ def main() -> None:
                 sample["aes_shared_clip_version"] = aes_scorer.FEATURE_VERSION
             if cover_extractor is not None:
                 sample["cover_feature_version"] = cover_extractor.FEATURE_VERSION
+            if cover_technical_feat is not None:
+                sample["cover_technical_feat"] = cover_technical_feat.numpy()
+                sample["cover_technical_feature_version"] = (
+                    cover_technical_extractor.FEATURE_VERSION
+                )
+                sample["cover_technical_feature_dim"] = (
+                    cover_technical_extractor.FEATURE_DIM
+                )
             save_pt(sample, out_pt)
             processed += 1
 

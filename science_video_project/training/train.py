@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -8,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import balanced_accuracy_score, f1_score
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, spearmanr
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -65,6 +67,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Inputs visible to the technical branch; other model branches remain unchanged.",
     )
+    parser.add_argument(
+        "--technical_visual_source",
+        choices=["clip", "cover", "clip_cover"],
+        default=None,
+        help="Visual representation used only by the technical branch.",
+    )
+    parser.add_argument("--technical_clip_projection_dim", type=int, default=None)
+    parser.add_argument("--technical_cover_projection_dim", type=int, default=None)
     parser.add_argument("--disable_cross_gating", action="store_true")
     parser.add_argument("--fusion_mode", choices=["learned", "average"], default=CFG.fusion_mode)
     parser.add_argument(
@@ -121,6 +131,12 @@ def parse_args() -> argparse.Namespace:
     profile = get_profile(args.profile)
     if args.technical_feature_mode is None:
         args.technical_feature_mode = profile.technical_feature_mode
+    if args.technical_visual_source is None:
+        args.technical_visual_source = profile.technical_visual_source
+    if args.technical_clip_projection_dim is None:
+        args.technical_clip_projection_dim = profile.technical_clip_projection_dim
+    if args.technical_cover_projection_dim is None:
+        args.technical_cover_projection_dim = profile.technical_cover_projection_dim
     if args.aesthetic_feature_backend is None:
         args.aesthetic_feature_backend = profile.aesthetic_backend
         if args.aesthetic_feature_backend == "separate_clip":
@@ -438,6 +454,11 @@ def main() -> None:
         raise
 
     same_category_pair = args.pair_scope == "same_category"
+    split_payload = "\n".join(
+        [f"train:{video_id}" for video_id in sorted(train_df["video_id"].astype(str))]
+        + [f"val:{video_id}" for video_id in sorted(val_df["video_id"].astype(str))]
+    )
+    split_hash = hashlib.sha256(split_payload.encode("utf-8")).hexdigest()
 
     train_ds = PairwiseVideoDataset.from_metadata(
         train_df,
@@ -447,6 +468,7 @@ def main() -> None:
         use_native_clip=args.use_native_clip,
         use_cover_features=args.use_cover_features,
         aesthetic_feature_backend=args.aesthetic_feature_backend,
+        technical_visual_source=args.technical_visual_source,
     )
     val_ds = PairwiseVideoDataset.from_metadata(
         val_df,
@@ -456,6 +478,7 @@ def main() -> None:
         use_native_clip=args.use_native_clip,
         use_cover_features=args.use_cover_features,
         aesthetic_feature_backend=args.aesthetic_feature_backend,
+        technical_visual_source=args.technical_visual_source,
     )
 
     train_loader = DataLoader(
@@ -488,16 +511,23 @@ def main() -> None:
     model_config["fusion_mode"] = args.fusion_mode
     model_config["branch_weight_floor"] = args.branch_weight_floor
     model_config["technical_feature_mode"] = args.technical_feature_mode
+    model_config["technical_visual_source"] = args.technical_visual_source
+    model_config["technical_clip_projection_dim"] = args.technical_clip_projection_dim
+    model_config["technical_cover_projection_dim"] = args.technical_cover_projection_dim
     if args.disable_cross_gating:
         model_config["use_cross_gating"] = False
     model = MultiModalQualityModel(**model_config).to(device)
+    trainable_params = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
     use_audio_feature = not args.disable_audio
     logger.info(
-        "Science feature mode=%s | llm_text_source=%s | knowledge_gate=%s | technical=%s | aesthetic=%s | audio=%s | cover=%s | native_clip=%s | fusion=%s | branch_floor=%.2f | cross_gate=%s",
+        "Science feature mode=%s | llm_text_source=%s | knowledge_gate=%s | technical=%s/%s | aesthetic=%s | audio=%s | cover=%s | native_clip=%s | fusion=%s | branch_floor=%.2f | cross_gate=%s | split=%s",
         args.science_feature_mode,
         args.llm_text_source,
         model_config["use_knowledge_gate"],
         args.technical_feature_mode,
+        args.technical_visual_source,
         args.aesthetic_feature_backend,
         use_audio_feature,
         args.use_cover_features,
@@ -505,7 +535,9 @@ def main() -> None:
         args.fusion_mode,
         args.branch_weight_floor,
         model_config["use_cross_gating"],
+        split_hash[:12],
     )
+    training_started_at = time.perf_counter()
     pretrain_branches(
         model=model,
         loader=train_loader,
@@ -621,6 +653,7 @@ def main() -> None:
         branch_records = {
             "scientific": {}, "technical": {}, "aesthetic": {},
         }
+        technical_detail_records = {}
         fusion_weight_records = {}
         with torch.no_grad():
             for pos_batch, neg_batch in val_loader:
@@ -660,6 +693,22 @@ def main() -> None:
                                 )
                             }
                         )
+                for batch, output in ((pos_batch, pos_out), (neg_batch, neg_out)):
+                    predictions = torch.sigmoid(output["technical_score"]).squeeze(-1).detach().cpu().numpy()
+                    visual_targets = batch["visual_target"].squeeze(-1).detach().cpu().numpy()
+                    audio_targets = batch["audio_target"].squeeze(-1).detach().cpu().numpy()
+                    label_targets = batch["label_target"].squeeze(-1).detach().cpu().numpy()
+                    technical_detail_records.update(
+                        {
+                            video_id: (
+                                float(prediction), float(visual), float(audio), float(label)
+                            )
+                            for video_id, prediction, visual, audio, label in zip(
+                                batch["video_id"], predictions, visual_targets,
+                                audio_targets, label_targets,
+                            )
+                        }
+                    )
         if pos_scores_by_id and neg_scores_by_id:
             pos_prob_val = np.asarray(list(pos_scores_by_id.values()), dtype=np.float32)
             neg_prob_val = np.asarray(list(neg_scores_by_id.values()), dtype=np.float32)
@@ -686,6 +735,26 @@ def main() -> None:
                 val_metrics_thr[f"{prefix}_srcc"] = (
                     float(correlation) if np.isfinite(correlation) else 0.0
                 )
+                if prefix == "technical" and valid.sum() > 1:
+                    plcc = pearsonr(predictions[valid], targets[valid]).statistic
+                    errors = predictions[valid] - targets[valid]
+                    val_metrics_thr["technical_plcc"] = (
+                        float(plcc) if np.isfinite(plcc) else 0.0
+                    )
+                    val_metrics_thr["technical_mae"] = float(np.mean(np.abs(errors)))
+                    val_metrics_thr["technical_rmse"] = float(np.sqrt(np.mean(errors ** 2)))
+            if technical_detail_records:
+                details = np.asarray(list(technical_detail_records.values()), dtype=np.float32)
+                for name, column in (
+                    ("visual_srcc", 1), ("audio_srcc", 2), ("label_srcc", 3)
+                ):
+                    valid = details[:, column] >= 0
+                    correlation = spearmanr(
+                        details[valid, 0], details[valid, column]
+                    ).statistic
+                    val_metrics_thr[f"technical_{name}"] = (
+                        float(correlation) if np.isfinite(correlation) else 0.0
+                    )
             if fusion_weight_records:
                 mean_weights = np.stack(list(fusion_weight_records.values())).mean(axis=0)
                 for prefix, weight in zip(
@@ -732,6 +801,16 @@ def main() -> None:
                     "use_audio_feature": use_audio_feature,
                     "seed": args.seed,
                     "split_seed": args.split_seed,
+                    "split_hash": split_hash,
+                    "cover_technical_feature_version": (
+                        "cover_technical_swin3d_tiny_grpb_ytugc_v1"
+                        if args.technical_visual_source in {"cover", "clip_cover"}
+                        else None
+                    ),
+                    "feature_dims": {
+                        "clip_video_feat": model_config["video_dim"],
+                        "cover_technical_feat": model_config["cover_technical_dim"],
+                    },
                     "training_config": {
                         "epochs": args.epochs,
                         "batch_size": args.batch_size,
@@ -740,6 +819,9 @@ def main() -> None:
                         "split_seed": args.split_seed,
                         "use_audio_feature": use_audio_feature,
                         "technical_feature_mode": args.technical_feature_mode,
+                        "technical_visual_source": args.technical_visual_source,
+                        "technical_clip_projection_dim": args.technical_clip_projection_dim,
+                        "technical_cover_projection_dim": args.technical_cover_projection_dim,
                         "aesthetic_feature_backend": args.aesthetic_feature_backend,
                         "profile": args.profile,
                         "use_native_clip": args.use_native_clip,
@@ -757,6 +839,7 @@ def main() -> None:
                     },
                     "best_ranking_accuracy": best_rank_acc,
                     "best_epoch": best_epoch,
+                    "trainable_params": trainable_params,
                     "validation_metrics": val_metrics_thr,
                 },
                 ckpt_path,
@@ -768,8 +851,17 @@ def main() -> None:
                 logger.info("Early stopping at epoch %d (no improvement for %d epochs)", epoch, patience)
                 break
 
-    logger.info("Training finished. best_ranking_accuracy=%.4f @ epoch %d, best_threshold=%.2f",
-                best_rank_acc, best_epoch, best_checkpoint_threshold)
+    train_seconds = time.perf_counter() - training_started_at
+    if ckpt_path.exists():
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        checkpoint["train_seconds"] = train_seconds
+        checkpoint["trainable_params"] = trainable_params
+        torch.save(checkpoint, ckpt_path)
+    logger.info(
+        "Training finished. best_ranking_accuracy=%.4f @ epoch %d, best_threshold=%.2f | "
+        "train_seconds=%.2f | trainable_params=%d",
+        best_rank_acc, best_epoch, best_checkpoint_threshold, train_seconds, trainable_params,
+    )
 
 
 if __name__ == "__main__":

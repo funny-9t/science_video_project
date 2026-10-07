@@ -39,6 +39,8 @@ def main() -> None:
     }
     if profile.use_cover:
         expected["cover_feat"] = 3
+    if profile.use_cover_technical:
+        expected["cover_technical_feat"] = 768
     if profile.aesthetic_backend == "shared_clip":
         expected["aes_shared_clip_feat"] = 7
 
@@ -67,6 +69,12 @@ def main() -> None:
             cover_version = sample.get("cover_feature_version", "")
             if cover_version != COVERFeatureExtractor.FEATURE_VERSION:
                 bad.append((path.name, "cover_feature_version", repr(cover_version)))
+        if profile.use_cover_technical:
+            from pipeline.step_cover_technical import COVERTechnicalFeatureExtractor
+
+            version = sample.get("cover_technical_feature_version", "")
+            if version != COVERTechnicalFeatureExtractor.FEATURE_VERSION:
+                bad.append((path.name, "cover_technical_feature_version", repr(version)))
         if profile.aesthetic_backend == "shared_clip":
             from pipeline.step_aesthetic_clip import SharedCLIPAestheticScorer
 

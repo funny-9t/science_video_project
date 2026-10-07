@@ -67,6 +67,9 @@ class Config:
     llm_knowledge_dim: int = 4    # factual, logical, evidence, uncertainty scores
     llm_analysis_dim: int = 768   # RoBERTa encoding of DeepSeek analysis/reasoning text
     cover_dim: int = 3            # frozen COVER semantic/technical/aesthetic scores
+    cover_technical_dim: int = 768  # pooled COVER Swin-3D technical representation
+    technical_clip_projection_dim: int = 128
+    technical_cover_projection_dim: int = 256
     dnsmos_dim: int = 3           # DNSMOS 音频质量评分 (ovrl/sig/bak)
     wpm_dim: int = 1              # 每分钟字数 (Words Per Minute)
     speech_rhythm_dim: int = 6    # 段级语速节奏 (mean/std/min/max WPM + pause_ratio + speech_density)
@@ -89,6 +92,7 @@ class Config:
     fusion_mode: str = "learned"               # learned | average
     branch_weight_floor: float = 0.2            # preserve technical/aesthetic branches in learned fusion
     technical_feature_mode: str = "full_no_dnsmos"
+    technical_visual_source: str = "clip"
     use_knowledge_gate: bool = False            # IFG remains available through legacy/ablation modes
     science_fusion_mode: str = "concat"         # concat for main_v2; ifg for ablation
 

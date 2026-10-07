@@ -44,3 +44,8 @@ cover_outputs/
 # Environment files
 .env
 *.env.local
+
+# Generated experiment artifacts
+experiments/**/cache/
+experiments/**/training/
+*.pt

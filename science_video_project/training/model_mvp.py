@@ -2,6 +2,17 @@ import torch
 import torch.nn as nn
 
 
+ATTRIBUTE_NAMES = (
+    "science_info",
+    "topic_importance",
+    "science_access",
+    "content_interest",
+    "visual_quality",
+    "audio_quality",
+    "video_aesthetics",
+)
+
+
 class MLPBlock(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.2):
         super().__init__()
@@ -153,7 +164,12 @@ class TechnicalBranch(nn.Module):
     def __init__(self, video_dim: int, meta_dim: int, dnsmos_dim: int, wpm_dim: int,
                  rhythm_dim: int, hidden_dim: int, cover_dim: int = 3,
                  use_cover_features: bool = False,
-                 feature_mode: str = "full"):
+                 feature_mode: str = "full",
+                 visual_source: str = "clip",
+                 cover_technical_dim: int = 768,
+                 clip_projection_dim: int = 128,
+                 cover_projection_dim: int = 256,
+                 temporal_mode: str = "baseline"):
         super().__init__()
         valid_modes = {
             "full", "full_no_dnsmos", "visual_only", "visual_dnsmos", "dnsmos_only"
@@ -167,7 +183,59 @@ class TechnicalBranch(nn.Module):
         self.use_cover_features = use_cover_features
         self.feature_mode = feature_mode
         self.hidden_dim = hidden_dim
-        self.video_proj = MLPBlock(video_dim, hidden_dim, hidden_dim)
+        if visual_source not in {"clip", "cover", "clip_cover"}:
+            raise ValueError("visual_source must be 'clip', 'cover', or 'clip_cover'.")
+        self.visual_source = visual_source
+        self.cover_technical_dim = cover_technical_dim
+        self.clip_projection_dim = clip_projection_dim
+        self.cover_projection_dim = cover_projection_dim
+        if temporal_mode not in {"baseline", "mean_std", "mean_std_diff"}:
+            raise ValueError(
+                "temporal_mode must be 'baseline', 'mean_std', or 'mean_std_diff'."
+            )
+        self.temporal_mode = temporal_mode
+        temporal_multiplier = {
+            "baseline": 1,
+            "mean_std": 2,
+            "mean_std_diff": 4,
+        }[temporal_mode]
+        self.temporal_feature_dim = cover_technical_dim * temporal_multiplier
+        # Keep T0 parameterization byte-for-byte compatible with the current baseline.
+        self.video_proj = (
+            MLPBlock(video_dim, hidden_dim, hidden_dim)
+            if visual_source == "clip"
+            else None
+        )
+        self.cover_technical_proj = None
+        self.clip_context_proj = None
+        self.visual_fuse = None
+        if visual_source == "cover":
+            self.cover_technical_proj = nn.Sequential(
+                nn.LayerNorm(self.temporal_feature_dim),
+                nn.Linear(self.temporal_feature_dim, cover_projection_dim),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(cover_projection_dim, hidden_dim),
+                nn.ReLU(),
+            )
+        elif visual_source == "clip_cover":
+            self.clip_context_proj = nn.Sequential(
+                nn.LayerNorm(video_dim),
+                nn.Linear(video_dim, clip_projection_dim),
+                nn.GELU(),
+                nn.Dropout(0.2),
+            )
+            self.cover_technical_proj = nn.Sequential(
+                nn.LayerNorm(self.temporal_feature_dim),
+                nn.Linear(self.temporal_feature_dim, cover_projection_dim),
+                nn.GELU(),
+                nn.Dropout(0.2),
+            )
+            self.visual_fuse = MLPBlock(
+                clip_projection_dim + cover_projection_dim,
+                hidden_dim,
+                hidden_dim,
+            )
         self.meta_proj = MLPBlock(meta_dim, hidden_dim, hidden_dim)
         self.dnsmos_proj = MLPBlock(dnsmos_dim, hidden_dim, hidden_dim)
         self.wpm_proj = MLPBlock(wpm_dim, hidden_dim, hidden_dim)
@@ -188,6 +256,8 @@ class TechnicalBranch(nn.Module):
         wpm: torch.Tensor | None = None,
         speech_rhythm_feat: torch.Tensor | None = None,
         cover_feat: torch.Tensor | None = None,
+        cover_technical_feat: torch.Tensor | None = None,
+        cover_temporal_feat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_visual = self.feature_mode in {
             "full", "full_no_dnsmos", "visual_only", "visual_dnsmos"
@@ -196,7 +266,39 @@ class TechnicalBranch(nn.Module):
         use_context = self.feature_mode in {"full", "full_no_dnsmos"}
 
         zero_hidden = video_feat.new_zeros(video_feat.size(0), self.hidden_dim)
-        v = self.video_proj(video_feat) if use_visual else zero_hidden
+        if cover_technical_feat is None:
+            cover_technical_feat = video_feat.new_zeros(
+                video_feat.size(0), self.cover_technical_dim
+            )
+        cover_input = cover_technical_feat
+        if self.temporal_mode != "baseline":
+            if cover_temporal_feat is None or cover_temporal_feat.ndim != 3:
+                raise ValueError("Temporal COVER mode requires [B, T, D] features.")
+            mean_feat = cover_temporal_feat.mean(dim=1)
+            std_feat = cover_temporal_feat.std(dim=1, unbiased=False)
+            parts = [mean_feat, std_feat]
+            if self.temporal_mode == "mean_std_diff":
+                if cover_temporal_feat.size(1) < 2:
+                    diff_mean = torch.zeros_like(mean_feat)
+                    diff_std = torch.zeros_like(mean_feat)
+                else:
+                    difference = torch.abs(
+                        cover_temporal_feat[:, 1:, :] - cover_temporal_feat[:, :-1, :]
+                    )
+                    diff_mean = difference.mean(dim=1)
+                    diff_std = difference.std(dim=1, unbiased=False)
+                parts.extend([diff_mean, diff_std])
+            cover_input = torch.cat(parts, dim=-1)
+        if not use_visual:
+            v = zero_hidden
+        elif self.visual_source == "clip":
+            v = self.video_proj(video_feat)
+        elif self.visual_source == "cover":
+            v = self.cover_technical_proj(cover_input)
+        else:
+            clip_context = self.clip_context_proj(video_feat)
+            cover_quality = self.cover_technical_proj(cover_input)
+            v = self.visual_fuse(torch.cat([clip_context, cover_quality], dim=-1))
         m = self.meta_proj(meta_feat) if use_context else zero_hidden
         if dnsmos_feat is None:
             dnsmos_feat = torch.zeros(video_feat.size(0), 3, device=video_feat.device, dtype=video_feat.dtype)
@@ -274,7 +376,14 @@ class MultiModalQualityModel(nn.Module):
                  use_cross_gating: bool = True, cross_gating_dropout: float = 0.1,
                  cover_dim: int = 3, use_cover_features: bool = False,
                  fusion_mode: str = "learned", branch_weight_floor: float = 0.0,
-                 technical_feature_mode: str = "full"):
+                 technical_feature_mode: str = "full",
+                 technical_visual_source: str = "clip",
+                 cover_technical_dim: int = 768,
+                 technical_clip_projection_dim: int = 128,
+                 technical_cover_projection_dim: int = 256,
+                 technical_temporal_mode: str = "baseline",
+                 use_attribute_heads: bool = False,
+                 use_quality_head: bool = False):
         super().__init__()
         if fusion_mode not in {"learned", "average"}:
             raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
@@ -283,6 +392,8 @@ class MultiModalQualityModel(nn.Module):
         self.fusion_mode = fusion_mode
         self.branch_weight_floor = float(branch_weight_floor)
         self.use_cover_features = use_cover_features
+        self.use_attribute_heads = bool(use_attribute_heads)
+        self.use_quality_head = bool(use_quality_head)
         self.scientific_branch = ScientificBranch(text_dim, meta_dim, hidden_dim,
                                                   llm_knowledge_dim=llm_knowledge_dim,
                                                   llm_analysis_dim=llm_analysis_dim,
@@ -293,6 +404,11 @@ class MultiModalQualityModel(nn.Module):
             video_dim, meta_dim, dnsmos_dim, wpm_dim, rhythm_dim, hidden_dim,
             cover_dim=cover_dim, use_cover_features=use_cover_features,
             feature_mode=technical_feature_mode,
+            visual_source=technical_visual_source,
+            cover_technical_dim=cover_technical_dim,
+            clip_projection_dim=technical_clip_projection_dim,
+            cover_projection_dim=technical_cover_projection_dim,
+            temporal_mode=technical_temporal_mode,
         )
         self.aesthetic_branch = AestheticBranch(
             video_dim, text_dim, audio_dim, aes_dim, hidden_dim,
@@ -322,6 +438,21 @@ class MultiModalQualityModel(nn.Module):
             nn.ReLU(),
         )
         self.overall_head = nn.Linear(hidden_dim, 1)
+        if self.use_attribute_heads:
+            self.attribute_heads = nn.ModuleDict({
+                name: nn.Linear(hidden_dim, 1) for name in ATTRIBUTE_NAMES
+            })
+        else:
+            self.attribute_heads = None
+        if self.use_quality_head:
+            self.quality_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            self.quality_head = None
 
     def forward(
         self,
@@ -337,6 +468,8 @@ class MultiModalQualityModel(nn.Module):
         llm_analysis_feat: torch.Tensor | None = None,
         sci_hand_feat: torch.Tensor | None = None,
         cover_feat: torch.Tensor | None = None,
+        cover_technical_feat: torch.Tensor | None = None,
+        cover_temporal_feat: torch.Tensor | None = None,
         **_kwargs,
     ) -> dict[str, torch.Tensor]:
         sci_h, sci_s, knowledge_gate = self.scientific_branch(
@@ -351,6 +484,8 @@ class MultiModalQualityModel(nn.Module):
             video_feat, meta_feat,
             dnsmos_feat=dnsmos_feat, wpm=wpm, speech_rhythm_feat=speech_rhythm_feat,
             cover_feat=cover_feat,
+            cover_technical_feat=cover_technical_feat,
+            cover_temporal_feat=cover_temporal_feat,
         )
         if aes_feat is None:
             aes_feat = torch.zeros(video_feat.size(0), 7, device=video_feat.device)
@@ -372,6 +507,8 @@ class MultiModalQualityModel(nn.Module):
                 (sci_h.size(0), 3), 1.0 / 3.0,
                 device=sci_h.device, dtype=sci_h.dtype,
             )
+            fused_h = (sci_h + tech_h + aes_h) / 3.0
+            fusion_h = fused_h
             overall = (sci_s + tech_s + aes_s) / 3.0
         else:
             gate_in = torch.cat([sci_h, tech_h, aes_h], dim=-1)
@@ -387,6 +524,26 @@ class MultiModalQualityModel(nn.Module):
             fusion_in = torch.cat([fused_h, sci_s, tech_s, aes_s], dim=-1)
             fusion_h = self.fusion(fusion_in)
             overall = self.overall_head(fusion_h)
+        attribute_scores = {}
+        if self.attribute_heads is not None:
+            attribute_sources = {
+                "science_info": sci_h,
+                "topic_importance": sci_h,
+                "science_access": sci_h,
+                "content_interest": sci_h,
+                "visual_quality": tech_h,
+                "audio_quality": tech_h,
+                "video_aesthetics": aes_h,
+            }
+            attribute_scores = {
+                name: torch.sigmoid(head(attribute_sources[name]))
+                for name, head in self.attribute_heads.items()
+            }
+        quality_score = (
+            torch.sigmoid(self.quality_head(fusion_h))
+            if self.quality_head is not None
+            else None
+        )
         prob = torch.sigmoid(overall)
         return {
             "scientific_score": sci_s,
@@ -396,4 +553,6 @@ class MultiModalQualityModel(nn.Module):
             "probability": prob,
             "knowledge_gate_weights": knowledge_gate,
             "branch_weights": weights,
+            "attribute_scores": attribute_scores,
+            "quality_score": quality_score,
         }

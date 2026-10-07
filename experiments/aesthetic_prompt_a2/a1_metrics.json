@@ -1,0 +1,107 @@
+{
+  "variant": "a1_original",
+  "seed": 42,
+  "split_seed": 42,
+  "validation_hash": "79413d21918a956716f230456b80aec037be51bfd1c6a412a8c0a30087a2a58f",
+  "train_size": 492,
+  "validation_size": 123,
+  "stage1": {
+    "accuracy": 0.2682926829268293,
+    "f1": 0.4230769230769231,
+    "auc": 0.739057239057239,
+    "pr_auc": 0.42853934988840575,
+    "ranking_accuracy": 0.7390572390572391,
+    "best_threshold": 0.1,
+    "overall_srcc": 0.37431905573133023,
+    "sci_srcc": 0.42490881852923096,
+    "tech_srcc": 0.302330465197764,
+    "aes_srcc": 0.24045233418186043,
+    "aes_plcc": 0.24700396404838332,
+    "aes_mse": 0.04459434375166893,
+    "aes_mae": 0.17292778193950653,
+    "branch_macro_srcc": 0.3225638726362851,
+    "science_weight": 0.32848334312438965,
+    "technical_weight": 0.3313707411289215,
+    "aesthetic_weight": 0.34014591574668884,
+    "best_epoch": 9,
+    "checkpoint": "C:\\Users\\10465\\.codex\\worktrees\\1b6b\\science_video_ranker_mvp\\science_video_project\\outputs\\progressive_training\\P2\\stage1_best.pt"
+  },
+  "stage2": {
+    "accuracy": 0.8130081300813008,
+    "f1": 0.6229508196721312,
+    "auc": 0.8114478114478114,
+    "pr_auc": 0.6522443233493807,
+    "ranking_accuracy": 0.8114478114478114,
+    "best_threshold": 0.6500000000000001,
+    "overall_srcc": 0.45475465327087955,
+    "sci_srcc": 0.42516505287621725,
+    "tech_srcc": 0.2541899340844395,
+    "aes_srcc": 0.2783642183553374,
+    "aes_plcc": 0.27953588991446676,
+    "aes_mse": 0.03892481327056885,
+    "aes_mae": 0.15762490034103394,
+    "branch_macro_srcc": 0.3192397351053314,
+    "science_weight": 0.5903893113136292,
+    "technical_weight": 0.20481693744659424,
+    "aesthetic_weight": 0.2047937661409378,
+    "best_epoch": 8,
+    "checkpoint": "C:\\Users\\10465\\.codex\\worktrees\\1b6b\\science_video_ranker_mvp\\science_video_project\\outputs\\progressive_training\\P2\\stage2_best.pt"
+  },
+  "multi_seed_stage2": {
+    "seeds": [
+      42,
+      123,
+      2026
+    ],
+    "metrics": {
+      "aes_srcc": {
+        "mean": 0.26512033348406944,
+        "std": 0.01947639330916447
+      },
+      "aes_plcc": {
+        "mean": 0.25362189630228277,
+        "std": 0.02253979954598342
+      },
+      "aes_mse": {
+        "mean": 0.04185441384712855,
+        "std": 0.0025853055739865666
+      },
+      "aes_mae": {
+        "mean": 0.1634917159875234,
+        "std": 0.005324520367921273
+      },
+      "auc": {
+        "mean": 0.7997755331088664,
+        "std": 0.016043102693225043
+      },
+      "pr_auc": {
+        "mean": 0.6173967712523144,
+        "std": 0.03574357611149403
+      },
+      "accuracy": {
+        "mean": 0.7940379403794037,
+        "std": 0.01692411381679781
+      },
+      "f1": {
+        "mean": 0.6235117869116443,
+        "std": 0.015104433091463422
+      },
+      "overall_srcc": {
+        "mean": 0.4298745753854276,
+        "std": 0.06968869449213203
+      },
+      "science_weight": {
+        "mean": 0.572084903717041,
+        "std": 0.03267607128284121
+      },
+      "technical_weight": {
+        "mean": 0.21301702658335367,
+        "std": 0.013867378852080902
+      },
+      "aesthetic_weight": {
+        "mean": 0.21489807963371277,
+        "std": 0.018820409761782675
+      }
+    }
+  }
+}

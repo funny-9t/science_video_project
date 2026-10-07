@@ -1,0 +1,42 @@
+{
+  "prompt_version": "a2_domain_semantic",
+  "feature_version": "shared_clip_vitl14_a2_domain_semantic_v1",
+  "feature_dim": 7,
+  "prompts": [
+    {
+      "name": "composition",
+      "positive": "a video frame with refined and well-balanced composition",
+      "negative": "a video frame with poor and unbalanced composition"
+    },
+    {
+      "name": "color_harmony",
+      "positive": "a video frame with harmonious and visually pleasing colors",
+      "negative": "a video frame with disharmonious and visually unpleasant colors"
+    },
+    {
+      "name": "lighting",
+      "positive": "a video frame with balanced and aesthetically pleasing lighting",
+      "negative": "a video frame with unbalanced and aesthetically poor lighting"
+    },
+    {
+      "name": "visual_hierarchy",
+      "positive": "a video frame with a clear and well-organized visual hierarchy",
+      "negative": "a video frame with a confusing and disorganized visual hierarchy"
+    },
+    {
+      "name": "visual_presentation",
+      "positive": "a video frame with well-arranged and coherent visual presentation",
+      "negative": "a video frame with poorly arranged and confusing visual presentation"
+    },
+    {
+      "name": "visual_refinement",
+      "positive": "a polished video frame with refined visual details",
+      "negative": "a rough video frame with poorly handled visual details"
+    },
+    {
+      "name": "visual_appeal",
+      "positive": "a visually appealing and aesthetically pleasing video frame",
+      "negative": "a visually unappealing and aesthetically poor video frame"
+    }
+  ]
+}

@@ -6,12 +6,6 @@ from PIL import Image
 from safetensors import safe_open
 from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModelWithProjection
 
-try:
-    import clip
-except ImportError:
-    clip = None
-
-
 class VideoEncoder:
     def __init__(self, model_name: str = "ViT-B/32", device: str = "cuda", batch_size: int = 32):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
@@ -26,12 +20,14 @@ class VideoEncoder:
             self.backend = "hf"
             self.model, self.processor = self._load_hf_vision_model(resolved["path"])
         else:
-            if clip is None:
+            try:
+                import clip as openai_clip
+            except ImportError as exc:
                 raise RuntimeError(
                     "The openai-clip package is required for an OpenAI CLIP checkpoint. "
                     "Use the local Hugging Face CLIP path for main_v2."
-                )
-            self.model, self.preprocess = clip.load(resolved["path"], device=self.device)
+                ) from exc
+            self.model, self.preprocess = openai_clip.load(resolved["path"], device=self.device)
         self.model.eval()
         self.model = self.model.to(self.device, dtype=self.dtype if self.device.type == "cuda" else torch.float32)
 
