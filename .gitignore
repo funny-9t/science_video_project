@@ -49,3 +49,5 @@ cover_outputs/
 experiments/**/cache/
 experiments/**/training/
 *.pt
+/science_video_project/data/external/aadb_official/imgListFiles_label
+science_video_project/data/external/aadb_official/imgListFiles_label.zip
