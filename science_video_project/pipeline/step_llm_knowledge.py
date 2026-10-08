@@ -71,10 +71,11 @@ class LLMKnowledgeExtractor:
         max_retries: int = 3,
         retry_delay: float = 2.0,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         max_input_chars: int = 12000,
         reasoning_effort: str = "high",
         request_timeout: float = 90.0,
+        cache_policy: str = "prefer",
     ) -> None:
         del temperature  # Thinking mode ignores sampling controls.
         self.api_key = (api_key or "").strip()
@@ -87,6 +88,9 @@ class LLMKnowledgeExtractor:
         self.max_input_chars = max_input_chars
         self.reasoning_effort = reasoning_effort
         self.request_timeout = request_timeout
+        if cache_policy not in {"prefer", "require"}:
+            raise ValueError("cache_policy must be 'prefer' or 'require'.")
+        self.cache_policy = cache_policy
 
         self.client = None
         if self.api_key:
@@ -212,12 +216,20 @@ class LLMKnowledgeExtractor:
             cached = self._cache.get(cache_key)
         if cached is not None:
             result = self._from_cache(cached)
-            if result.is_valid or self.client is None:
+            if result.is_valid:
                 if verbose:
                     print(f"[LLMKnowledge] cache hit: {result.scores.tolist()}")
                 return result
+            if self.cache_policy == "require":
+                raise ValueError(f"Cached DeepSeek response is invalid: {cache_key}")
             if verbose:
                 print("[LLMKnowledge] retrying an invalid cached response")
+
+        if self.cache_policy == "require":
+            raise KeyError(
+                f"Required DeepSeek cache entry is missing: {cache_key}. "
+                "Run tools/prefetch_llm_cache.py before feature extraction."
+            )
 
         content, reasoning = self._call_api(content_text)
         scores, analysis_text, is_valid = self._parse_response(content)

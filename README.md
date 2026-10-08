@@ -49,7 +49,7 @@
 文本 + 元数据 + LLM评分 + LLM分析语义 + 科学性手工特征
         -> ScientificBranch -> scientific_score
 
-视频 + 元数据 + DNSMOS + WPM + 语速节奏 + COVER技术/语义质量
+视频 + 元数据 + WPM + 语速节奏（DNSMOS/COVER 仅消融）
         -> TechnicalBranch  -> technical_score
 
 视频 + 文本 + 音频 + CLIP美学特征 + COVER美学/语义质量
@@ -211,7 +211,21 @@ cd science_video_project
 运行主线特征流水线：
 
 ```bash
-python pipeline/run_pipeline.py
+python pipeline/run_pipeline.py --profile main_v2
+```
+
+`main_v2` 默认使用 DeepSeek 离线缓存、Shared CLIP，且不加载 COVER/DNSMOS。正式 `main_v3`
+在此基础上增加冻结 COVER technical backbone 的 768D 离线缓存，不运行完整 COVER score：
+
+```bash
+python pipeline/run_pipeline.py --profile main_v3
+```
+
+完整 COVER 消融与旧完整路径分别使用：
+
+```bash
+python pipeline/run_pipeline.py --profile cover_ablation
+python pipeline/run_pipeline.py --profile legacy_full
 ```
 
 输出位置：
@@ -304,21 +318,25 @@ python tools/run_cover_ablation.py --seeds 42 --epochs 15 --patience 5 --lr 1e-5
 建议先用单 seed 筛选方案，再对候选方案执行 `--seeds 42,43,44`。报告会同时保存
 pairwise accuracy、唯一视频 AUC/PR-AUC、三个分支 SRCC 和科学性融合权重。
 
-当前固定划分下的最高分训练配置：
+当前高效主路径训练配置：
 
 ```bash
 python training/train.py \
-  --epochs 15 \
-  --early_stop_patience 5 \
-  --lr 1e-5 \
+  --profile main_v2 \
+  --epochs 30 \
+  --early_stop_patience 10 \
+  --lr 5e-5 \
   --seed 42 \
   --split_seed 42 \
-  --disable_audio \
   --pair_scope global \
-  --loss_type focal \
-  --science_feature_mode analysis_concat \
-  --llm_text_source analysis \
-  --checkpoint outputs/checkpoints/best_llm_optimized.pt
+  --loss_type ranknet \
+  --lambda_pointwise 0.1 \
+  --branch_weight_floor 0.2 \
+  --technical_feature_mode full_no_dnsmos \
+  --aesthetic_feature_backend shared_clip \
+  --science_feature_mode analysis_scores_concat \
+  --llm_text_source reasoning_and_analysis \
+  --checkpoint outputs/checkpoints/best_main_v2.pt
 ```
 
 默认输出：
@@ -377,55 +395,58 @@ python inference/full_infer.py \
 
 - checkpoint 适配逻辑只处理 MVP 模型参数，不再错误注入 research-only 参数
 - 训练和推理统一使用 checkpoint 中保存的模型配置
-- 推理阶段补齐训练使用的 DNSMOS、WPM、语速节奏、科学性手工特征、LLM 知识特征
+- 推理阶段按 checkpoint 配置恢复 WPM、语速节奏、科学性和可选 DNSMOS 特征
 - DeepSeek 模型更新为 `deepseek-v4-pro`，启用 thinking mode、JSON 输出、失败重试与断点缓存
-- LLM 输出长度提高到 4096 token，避免推理过程占满预算后截断最终 JSON
+- LLM 输出长度提高到 8192 token，避免高强度推理过程占满预算后截断最终 JSON
 - 科学性分支新增 RoBERTa 分析文本编码，以及论文思路对应的 IFG + residual 融合
 - 元数据加载会排除同一 `video_id` 标签互相冲突的样本，并按 `video_id` 去重，防止训练/验证泄漏
 - `seed` 与 `split_seed` 已拆分，可在固定验证集上独立评估初始化稳定性
 - 推理会从 checkpoint 恢复 LLM 文本源和科学性特征掩码，避免训练/推理特征不一致
 - 验证集 pair 改为确定性生成，实验指标更容易复现
 - 推理模块降低顶层重依赖，单独加载 checkpoint 不会因为 `clip` 或 `soundfile` 缺失而失败
+- 新增 `main_v2`、`cover_ablation`、`legacy_full` 三种 profile；COVER 不再进入默认路径
+- 常规提取和推理强制 DeepSeek cache-only，只有 `prefetch_llm_cache.py` 或显式
+  `--llm-online-enroll` 可以访问 API
+- 主科学性融合显式设为 concat，IFG 仅保留为消融方案
+- DNSMOS 已从 `main_v2` 技术分支移除，历史特征和消融入口继续保留
+- Shared CLIP 直接复用 ViT-L/14 帧向量生成美学特征，不再执行第二套图像编码
 
 当前数据状态：
 
 ```text
-唯一特征文件：379
-DeepSeek 有效缓存：379/379
-Whisper audio / DNSMOS / WPM / speech rhythm / 两套 LLM 分析向量：379/379
-去重并排除冲突标签后参与训练：342（正类 33，负类 309）
+筛选 CSV：692 行（正类 183，负类 509）
+唯一视频：629 个
+排除 14 个标签冲突 ID，并合并同 ID 重复标注后：615 个（正类 164，负类 451）
+唯一特征文件：652（含 37 个清洗元数据外的历史文件）
+实际训练覆盖：615/615（正类 164，负类 451）
+DeepSeek 有效缓存：652/652
+Whisper audio / DNSMOS / WPM / speech rhythm / 两套 LLM 分析向量：615/615
+COVER 官方三分支特征：615/615
 ```
 
-另有 20 个当前未参与训练的特征文件缺少 `aes_feat`。
+2026-08-18 已断点补齐原先缺失的 273 个训练样本。`tools/check_features.py` 检查 615 个训练文件后，
+所有字段维度、有限值和 COVER 版本均通过。另有 37 个历史特征文件不属于清洗后的训练元数据，训练时自动排除。
 
 ## 10. 科学性实验结果
 
-以下结果使用同一数据划分（`split_seed=42`）、全局 pair、focal ranking loss、`seed=42`。
-除学习率搜索外，消融学习率均为 `5e-5`：
+以下结果使用完整 615 个视频、同一数据划分（`split_seed=42`）、全局 pair、`seed=42` 和 `lr=5e-5`：
 
 | 科学性方案 | 验证 pairwise Acc / AUC |
 |---|---:|
-| 无 LLM | 0.6728 |
-| 仅 4 维 LLM 评分 | 0.6751 |
-| 仅最终分析文本 RoBERTa 向量，直接拼接 | **0.7558** |
-| 最终分析向量 + 4 维评分，直接拼接 | 0.7396 |
-| 推理全文 + 最终分析 + 评分，直接拼接 | 0.7212 |
-| 最终分析向量 + 评分，IFG | 0.6659 |
-| 推理全文 + 最终分析 + 评分，IFG | 0.6682 |
-| 推理全文 + 评分 + 手工科学特征，完整 IFG | 0.6912 |
+| 无 LLM | 0.7721 |
+| 仅 4 维 LLM 评分 | 0.7663 |
+| 仅最终分析文本 RoBERTa 向量，直接拼接 | 0.7923 |
+| 最终分析向量 + 4 维评分，直接拼接 | 0.7859 |
+| **推理全文 + 最终分析 + 评分，直接拼接** | **0.8091** |
+| 最终分析向量 + 评分，IFG | 0.7852 |
+| 推理全文 + 最终分析 + 评分，IFG | 0.8020 |
+| 推理全文 + 评分 + 手工科学特征，完整 IFG | 0.8051 |
 
-对最佳结构搜索学习率后，`lr=1e-5` 在 seed 42 达到 **0.7926**（第 8 轮），
-对应 checkpoint 为 `outputs/checkpoints/best_llm_optimized.pt`。
+最佳训练目标为 RankNet + pointwise calibration。加入 20% 分支权重下限后，seed 42 达到 **0.8438**，
+三种子均值为 `0.7987 +/- 0.0377`。该约束避免 learned fusion 完全塌缩到科学分支，同时保留了最佳性能。
 
-修复 faster-whisper encoder 接口并补齐真实 `audio_feat` 后，同配置启用音频得到 0.7857，
-显式禁用音频仍复现 0.7926；无 LLM 基线启用音频由 0.6728 提升到 0.6843。因此音频表示对基础模型
-有一定帮助，但没有提升当前 LLM 最佳组合。默认最佳 checkpoint 保存 `use_audio_feature=false`，
-启用音频的候选模型保存为 `outputs/checkpoints/best_llm_with_audio.pt`。
-
-结论：参考论文的“LLM 知识增强”思路可行，但当前数据上不应直接照搬 IFG。效果最好的做法是仅编码
-DeepSeek 的最终结构化分析文本并直接拼接；显式评分、完整推理文本和 IFG 都会降低单次实验指标。
-3-seed 固定划分复验仍有较大方差；`5e-5` 下分析方案均值为 0.6605，无 LLM 均值为 0.6536，
-因此论文中应把 0.7926 表述为固定划分最佳结果，而不是稳定显著提升。
+最终主模型为 `outputs/checkpoints/best_full_dataset_balanced.pt`；完整实验解释见
+`EXPERIMENT_RESULTS_FULL_DATASET.md`。
 
 完整结果位于：
 
@@ -433,9 +454,179 @@ DeepSeek 的最终结构化分析文本并直接拼接；显式评分、完整�
 outputs/logs/feature_diagnostics.json
 outputs/logs/feature_diagnostics_with_audio.json
 outputs/logs/science_ablation.json
+outputs/logs/cover_ablation.json
+outputs/logs/cover_ablation_multiseed.json
+outputs/logs/branch_floor_multiseed.json
 outputs/checkpoints/science_ablation/
-outputs/checkpoints/science_fixed_split/
-outputs/checkpoints/science_lr_stability/
+outputs/checkpoints/cover_ablation/
+outputs/logs/technical_ablation.json
+outputs/logs/aesthetic_ablation.json
+outputs/logs/shared_aesthetic_backfill.json
+outputs/checkpoints/aesthetic_ablation/
+outputs/main_v3_validation/
+```
+
+## 10.1 高效主路径消融（2026-08-22）
+
+技术分支三随机种子结果：
+
+| 技术输入 | ROC-AUC mean +/- std | PR-AUC | Technical SRCC |
+|---|---:|---:|---:|
+| visual only | 0.7825 +/- 0.0151 | 0.5792 | 0.0625 |
+| visual + DNSMOS | 0.7873 +/- 0.0209 | 0.5728 | 0.0359 |
+| DNSMOS only | 0.7836 +/- 0.0201 | 0.5984 | 0.0336 |
+| full | 0.7859 +/- 0.0256 | 0.5831 | 0.0712 |
+| **full without DNSMOS** | 0.7809 +/- 0.0179 | 0.5789 | **0.1083** |
+
+DNSMOS 对完整技术分支的平均 AUC 仅增加 0.0050，却使 Technical SRCC 下降 0.0371，
+因此 `main_v2` 使用 `full_no_dnsmos`，即保留视觉、元信息、WPM 和 speech rhythm。
+
+Shared CLIP 三随机种子结果：
+
+| 美学特征 | ROC-AUC mean +/- std | PR-AUC | Aesthetic SRCC |
+|---|---:|---:|---:|
+| legacy ViT-B/32 | 0.7809 +/- 0.0179 | 0.5789 | 0.2655 |
+| **shared ViT-L/14** | **0.7853 +/- 0.0230** | **0.6047** | **0.2704** |
+
+652 个共享美学特征全部回填成功；利用现有帧向量计算 652 条特征只需 3.12 秒。
+历史最高性能 checkpoint `best_full_dataset_balanced.pt` 仍保留；高效路径 checkpoint 为
+`outputs/checkpoints/best_main_v2.pt`。
+
+## 10.2 COVER Technical main_v3 稳定性验证（2026-09-12）
+
+固定 `split_seed=42`，在训练 seeds `42/123/2026` 上严格比较 main_v2 与仅替换技术视觉表征的
+main_v3-candidate：
+
+| 模型 | ROC-AUC mean +/- std | PR-AUC | Technical SRCC |
+|---|---:|---:|---:|
+| main_v2 | 0.7721 +/- 0.0169 | 0.5584 | 0.1109 |
+| CLIP+COVER D1 (128+256) | 0.7706 +/- 0.0340 | 0.5841 | 0.2709 |
+| **CLIP+COVER D3 (256+256)** | **0.7804 +/- 0.0178** | **0.5850** | **0.2900** |
+
+D3 相对 main_v2 的 AUC、PR-AUC、Technical SRCC 分别提高 `0.0083`、`0.0266`、`0.1791`；
+三个 seed 的 Technical SRCC 均提高。技术分支权重仍约为 0.20，说明旧技术表征偏弱并不是
+fusion 偏向科学分支的唯一原因。正式 `main_v3` 使用 D3 的 CLIP 256D + COVER 256D，训练参数
+1,516,423 个；COVER backbone 的 28,078,620 个参数冻结且只参与离线特征提取。
+
+完整原始结果与报告位于 `outputs/main_v3_validation/`。
+
+## 10.3 COVER-inspired Progressive Training（2026-09-14）
+
+在 main_v3-D3 上固定数据、特征、`split_seed=42` 和验证划分，比较直接联合训练 J0 与
+branch warm-up、branch RankNet、总体排序集成和融合校准。最终采用不含额外 Stage 3 的
+P2-S2（Stage1 branch warm-up + Stage2 overall ranking，branch RankNet 权重 0.05）：
+
+| 模型 | ROC-AUC mean +/- std | PR-AUC | Accuracy | F1 | Technical SRCC |
+|---|---:|---:|---:|---:|---:|
+| J0 joint | 0.7782 +/- 0.0171 | 0.5885 | 0.7696 | 0.6238 | 0.2495 |
+| **P2-S2** | **0.7998 +/- 0.0160** | **0.6174** | **0.7940** | 0.6235 | 0.2475 |
+
+P2-S2 在 seeds `42/123/2026` 上逐一提高 AUC，平均 AUC、PR-AUC、Accuracy 分别提升
+`0.0215`、`0.0289`、`0.0244`，F1 基本持平。Technical/Aesthetic SRCC 没有稳定提高，且
+Technical SRCC 从 Stage1 到 Stage2 的三种子平均漂移为 `-0.0624`；因此结论是分支级排序正则
+改善总体排序泛化，而不是已经消除梯度竞争或 Technical branch collapse。
+
+最终决策为 `USE_PROGRESSIVE_BRANCH_RANK`。完整逐 seed 结果、epoch history、target-gap 统计、
+checkpoints 与报告位于 `outputs/progressive_training/`。
+
+## 10.4 Fine-grained Attribute Supervision（2026-09-14）
+
+在固定 main_v3-D3 representation、615 个清洗样本、相同 492/123 划分和 validation hash 的
+条件下，新增 7 个轻量属性头与一个可选连续质量头。所有 head 仅用于辅助监督，不作为 fusion
+或 ranking head 的输入；本轮没有重新提取 CLIP、COVER、DeepSeek、Whisper 或 DNSMOS 特征。
+
+| 模型（seed 42） | ROC-AUC | PR-AUC | Branch macro SRCC | Attribute mean SRCC | Quality SRCC |
+|---|---:|---:|---:|---:|---:|
+| A0 Ranking only | 0.7798 | 0.6651 | 0.1019 | - | - |
+| A1 Branch + consistency | 0.7923 | 0.6444 | 0.2971 | - | - |
+| **A2 7 attributes** | **0.8118** | **0.6624** | 0.2957 | **0.3328** | - |
+| A3 Branch + attributes | 0.7896 | 0.6517 | 0.2882 | 0.3185 | - |
+| A4 Branch + attributes + quality | 0.7976 | 0.6360 | 0.2883 | 0.3117 | 0.3997 |
+
+A1 与入选 A2 的 seeds `42/123/2026` 复验中，A2 的 ROC-AUC 为
+`0.7847 +/- 0.0215`，相对 A1 的 `0.7791 +/- 0.0183` 提高 `0.0056`；PR-AUC 提高
+`0.0229`。最终决策为 `PROMOTE_ATTRIBUTE_SUPERVISION`：7 项原始评分比 3 项聚合 target
+更适合作为后续监督信号。但 A2 尚未超过 progressive P2-S2 的 `0.7998 +/- 0.0160` AUC，
+因此不直接替换当前最佳 checkpoint，下一步应在 P2 Stage2 内验证 attribute loss。
+
+复现实验：
+
+```bash
+python tools/run_fine_grained_supervision.py --experiments F0,F1,F2,F3,A2,A3,A4
+python tools/run_fine_grained_supervision.py --seed 123 --experiments A1,A2
+python tools/run_fine_grained_supervision.py --seed 2026 --experiments A1,A2
+```
+
+可用开关包括 `--use-branch-supervision`、`--use-attribute-supervision`、
+`--use-quality-supervision`、`--lambda-attr` 和 `--lambda-quality`。完整结果、逐属性指标、
+checkpoints 与标签审计位于 `outputs/fine_grained_supervision/`。
+
+## 10.5 Progressive Training × Attribute Supervision（2026-09-14）
+
+进一步将 7 属性监督接入当前最强 P2-S2。P0 复用原 P2-S2；P1 增加 attribute MSE；P2 再增加
+continuous quality MSE。模型结构、特征、数据划分、branch floor 和两阶段训练日程均保持不变。
+
+| 模型（seed 42） | ROC-AUC | PR-AUC | F1 | Branch macro SRCC | Attribute SRCC | Quality SRCC |
+|---|---:|---:|---:|---:|---:|---:|
+| P0 P2-S2 | 0.8114 | **0.6522** | 0.6230 | 0.3192 | - | - |
+| P1 + attributes | 0.8178 | 0.6481 | 0.6250 | 0.3149 | 0.3420 | - |
+| **P2 + attributes + quality** | **0.8185** | 0.6495 | **0.6400** | 0.3197 | 0.3322 | 0.4363 |
+| P1-Simple, no branch MSE | 0.8027 | 0.6013 | 0.6329 | 0.3481 | 0.3426 | - |
+
+seed=42 触发了 P1-Simple，但删除 branch MSE 后 AUC/PR-AUC 分别比 P1 下降
+`0.0152/0.0468`，因此保留 branch supervision。P1 和 P2 均晋级 seeds `42/123/2026`：
+
+| 模型 | ROC-AUC mean +/- std | PR-AUC mean +/- std | F1 mean +/- std |
+|---|---:|---:|---:|
+| P0 | 0.7998 +/- 0.0160 | 0.6174 +/- 0.0357 | **0.6235 +/- 0.0151** |
+| **P1** | **0.8000 +/- 0.0186** | **0.6216 +/- 0.0314** | 0.6082 +/- 0.0199 |
+| P2 | 0.7923 +/- 0.0268 | 0.5770 +/- 0.0643 | 0.6057 +/- 0.0503 |
+
+P1 相对 P0 的 AUC/PR-AUC/F1 分别变化 `+0.0002/+0.0042/-0.0153`，attribute mean SRCC 为
+`0.3138 +/- 0.0246`。它满足原实验的机械晋级门槛，但提升小于随机种子波动，且 branch macro
+与 q_rank-quality 分别下降 `0.0118/0.0366`。
+P2 相对 P0 的 AUC/PR-AUC 为 `-0.0075/-0.0404`；虽然 quality head 保持
+`0.3993 +/- 0.0374` SRCC，适合作为诊断输出，但不进入最终排名模型。综合稳定性、F1、分支语义
+和连续质量相关性后，正式主模型退回 P0，最终决策为 `KEEP_P2_S2`；P1 仅保留为属性可解释性消融。
+
+```bash
+python tools/run_progressive_attribute.py --models P0,P1,P2
+python tools/run_progressive_attribute.py --models P1-Simple
+python tools/run_progressive_attribute.py --seed 123 --models P0,P1,P2
+python tools/run_progressive_attribute.py --seed 2026 --models P0,P1,P2
+```
+
+完整结果、stage diagnostics、epoch loss 和 checkpoints 位于 `outputs/progressive_attribute/`。
+
+## 10.6 Temporal Quality Statistics（2026-09-20）
+
+在最终 `KEEP_P2_S2` 上只替换 COVER technical 路径的时间聚合方式。原缓存是对
+`[B,768,T,H,W]` 同时做时空均值得到的 768D 向量；本轮使用同一 COVER checkpoint、采样和预处理，
+一次性缓存空间池化后的 `[20,768]` 序列。615/615 成功，无短序列；序列均值复现旧特征的最大误差
+为 `4.77e-7`。
+
+| seed 42 | AUC | PR-AUC | F1 | Overall SRCC | Tech SRCC | Tech PLCC | Tech MSE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T0 pooled | 0.8114 | 0.6522 | 0.6230 | 0.4548 | 0.2542 | 0.2090 | 0.0438 |
+| T1 mean+std | **0.8148** | **0.6520** | **0.6349** | 0.4529 | 0.2616 | 0.2480 | **0.0405** |
+| T2 mean+std+diff | 0.8077 | 0.6235 | 0.6216 | **0.4649** | **0.3602** | **0.3727** | 0.0499 |
+
+T2 因技术分支提升明显而晋级三种子，但收益不稳定：
+
+| Variant | AUC mean +/- std | PR-AUC | Tech SRCC | Tech PLCC | Tech MSE |
+|---|---:|---:|---:|---:|---:|
+| **T0** | **0.7998 +/- 0.0160** | **0.6174 +/- 0.0357** | 0.2475 +/- 0.0366 | 0.2362 +/- 0.0636 | **0.0486 +/- 0.0070** |
+| T2 | 0.7924 +/- 0.0147 | 0.5946 +/- 0.0258 | **0.2717 +/- 0.0911** | **0.2894 +/- 0.0994** | 0.0657 +/- 0.0327 |
+
+T2 的逐 seed Tech SRCC 变化为 `+0.1060/-0.0297/-0.0036`，仅 seed 42 提升；平均
+AUC/PR-AUC 分别下降 `0.0074/0.0228`，Tech MSE 增加 `0.0171`。最终决策为 `KEEP_T0`，
+继续使用原 `KEEP_P2_S2`。时间统计保留为诊断特征，不进入主模型。
+
+```bash
+python tools/backfill_cover_temporal.py --metadata <metadata.csv> --feature-dir <features>
+python tools/run_temporal_quality_statistics.py --metadata <metadata.csv> --feature-dir <features> --variants T0_KEEP_P2_S2,T1_MEAN_STD,T2_MEAN_STD_DIFF --seed 42
+python tools/run_temporal_quality_statistics.py --metadata <metadata.csv> --feature-dir <features> --variants T0_KEEP_P2_S2,T2_MEAN_STD_DIFF --seed 123
+python tools/run_temporal_quality_statistics.py --metadata <metadata.csv> --feature-dir <features> --variants T0_KEEP_P2_S2,T2_MEAN_STD_DIFF --seed 2026
 ```
 
 ## 11. 常见问题
@@ -484,7 +675,7 @@ $env:DEEPSEEK_API_KEY="你的 API Key"
 - 无参考科普短视频质量评估任务定义
 - 弱监督 pairwise ranking 建模
 - 科学性、技术性、美学性三分支结构
-- ASR + BERT + CLIP + Whisper + DNSMOS 多模态特征融合
+- ASR + BERT + Shared CLIP + Whisper 多模态特征融合，DNSMOS/COVER 可选
 - LLM 知识特征增强科学性评估
 - 门控融合与可解释分支分数
 - 验证集固定 pair 的实验可复现设计

@@ -44,3 +44,10 @@ cover_outputs/
 # Environment files
 .env
 *.env.local
+
+# Generated experiment artifacts
+experiments/**/cache/
+experiments/**/training/
+*.pt
+/science_video_project/data/external/aadb_official/imgListFiles_label
+science_video_project/data/external/aadb_official/imgListFiles_label.zip

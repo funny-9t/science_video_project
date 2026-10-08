@@ -1,0 +1,42 @@
+{
+  "prompt_version": "a1_original",
+  "feature_version": "shared_clip_vitl14_prompts_v1",
+  "feature_dim": 7,
+  "prompts": [
+    {
+      "name": "clarity",
+      "positive": "a sharp clear image with fine details",
+      "negative": "a blurry fuzzy out-of-focus image"
+    },
+    {
+      "name": "cleanliness",
+      "positive": "a clean visual design with no distracting elements",
+      "negative": "a cluttered messy noisy image"
+    },
+    {
+      "name": "composition",
+      "positive": "a well-composed professionally framed shot",
+      "negative": "a poorly composed awkwardly framed shot"
+    },
+    {
+      "name": "appeal",
+      "positive": "a visually appealing attractive beautiful image",
+      "negative": "an ugly unpleasant难看 image"
+    },
+    {
+      "name": "lighting",
+      "positive": "good lighting with balanced bright colors",
+      "negative": "poor lighting with dark dull flat colors"
+    },
+    {
+      "name": "text_readability",
+      "positive": "clear readable text and labels in a scientific diagram",
+      "negative": "unreadable messy text and labels in a scientific diagram"
+    },
+    {
+      "name": "professional",
+      "positive": "a professional high-quality scientific visualization",
+      "negative": "an amateur low-quality screenshot"
+    }
+  ]
+}

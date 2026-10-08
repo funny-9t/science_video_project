@@ -14,7 +14,7 @@ def collate_pair(
             if not isinstance(tensors[0], torch.Tensor):
                 result[k] = tensors
                 continue
-            if k == "frame_features":
+            if k in {"frame_features", "cover_temporal_feat"}:
                 # 变长序列: 找到最大长度，pad
                 max_len = max(t.size(0) for t in tensors)
                 feature_dim = next((t.size(-1) for t in tensors if t.ndim == 2 and t.size(0) > 0), 768)

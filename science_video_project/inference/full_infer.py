@@ -17,7 +17,11 @@ from inference.infer import (
     load_model,
 )
 from pipeline.config import CFG
-from pipeline.step_aesthetic_clip import CLIPAestheticScorer, DEFAULT_PROMPTS
+from pipeline.step_aesthetic_clip import (
+    CLIPAestheticScorer,
+    DEFAULT_PROMPTS,
+    SharedCLIPAestheticScorer,
+)
 from pipeline.step_audio import AudioEncoder
 from pipeline.step_dnsmos import DNSMOSScorer
 from pipeline.step_extract import VideoExtractor
@@ -33,7 +37,12 @@ from training.utils_train import get_device
 class InferenceEngine:
     """Inference engine that mirrors the training feature pipeline."""
 
-    def __init__(self, checkpoint_path: str, device: str = "cuda"):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cuda",
+        allow_llm_online_enroll: bool = False,
+    ):
         self.device = get_device(device)
         print(f"Using device: {self.device}")
 
@@ -43,14 +52,22 @@ class InferenceEngine:
         asr_path = _validate_model_path(CFG.asr_model_path, "ASR")
         audio_path = _validate_model_path(CFG.audio_model_path, "Audio")
 
-        self.text_encoder = TextEncoder(CFG.text_model_name, asr_path, device, CFG.local_files_only)
         self.video_encoder = VideoEncoder(CFG.clip_model_name, device)
+        if self.runtime_config["aesthetic_feature_backend"] == "shared_clip":
+            self.aes_scorer = SharedCLIPAestheticScorer(
+                CFG.clip_model_name, prompts=DEFAULT_PROMPTS, device=device
+            )
+        else:
+            self.aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=device)
+        self.text_encoder = TextEncoder(CFG.text_model_name, asr_path, device, CFG.local_files_only)
         self.audio_encoder = AudioEncoder(audio_path, device, out_dim=CFG.audio_dim, shared_model=self.text_encoder.asr)
         self.video_extractor = VideoExtractor(audio_sr=CFG.audio_sr)
-        self.aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=device)
-        self.dnsmos_scorer = DNSMOSScorer(device=device)
+        self.use_dnsmos = self.runtime_config["technical_feature_mode"] in {
+            "full", "visual_dnsmos", "dnsmos_only"
+        }
+        self.dnsmos_scorer = DNSMOSScorer(device=device) if self.use_dnsmos else None
         self.sci_hand_extractor = ScienceFeatureExtractor()
-        self.llm_extractor = _build_llm_extractor()
+        self.llm_extractor = _build_llm_extractor(allow_llm_online_enroll)
 
         print("All components initialized")
 
@@ -77,15 +94,33 @@ class InferenceEngine:
             title=str(row_data.get("title", "") or ""),
             tags=str(row_data.get("tags", "") or ""),
         )
-        video_feat = self.video_encoder.encode_frames(frame_path)
+        frame_features = self.video_encoder.encode_frame_features(
+            frame_path, max_frames=CFG.clip_max_frames
+        )
+        clip_video_feat = frame_features.mean(dim=0)
+        video_feat = (
+            clip_video_feat
+            if self.runtime_config["video_dim"] == CFG.clip_video_dim
+            else self.video_encoder.legacy_project(
+                clip_video_feat, output_dim=self.runtime_config["video_dim"]
+            )
+        )
         audio_feat = self.audio_encoder.encode(str(wav_path))
 
-        aes_result = self.aes_scorer.score_frames_batched(frame_path)
+        aes_result = (
+            self.aes_scorer.score_frame_features(frame_features)
+            if self.runtime_config["aesthetic_feature_backend"] == "shared_clip"
+            else self.aes_scorer.score_frames_batched(frame_path)
+        )
         aes_feat = torch.tensor(
             [aes_result["dimensions"][n] for n in aes_result["dimensions"].keys()],
             dtype=torch.float32,
         )
-        dnsmos_feat = self.dnsmos_scorer.score(str(wav_path))
+        dnsmos_feat = (
+            self.dnsmos_scorer.score(str(wav_path))
+            if self.dnsmos_scorer is not None
+            else torch.zeros(CFG.dnsmos_dim, dtype=torch.float32)
+        )
 
         subtitle_text = text_result.subtitle or ""
         audio_duration = 0.0
@@ -188,6 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verified", type=int, default=0, help="Verified flag")
     parser.add_argument("--publish_time", default="", help="Publish time")
     parser.add_argument("--output", default="", help="Output JSON path")
+    parser.add_argument("--llm-online-enroll", action="store_true")
     return parser.parse_args()
 
 
@@ -197,7 +233,10 @@ def main():
         print("Error: --video and --checkpoint are required")
         return
 
-    engine = InferenceEngine(args.checkpoint)
+    engine = InferenceEngine(
+        args.checkpoint,
+        allow_llm_online_enroll=args.llm_online_enroll,
+    )
     row_data = {
         "video_id": args.video_id or get_video_id(args.video),
         "title": args.title,

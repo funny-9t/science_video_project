@@ -1,12 +1,10 @@
 from pathlib import Path
 
-import clip
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from safetensors import safe_open
 from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModelWithProjection
-
 
 class VideoEncoder:
     def __init__(self, model_name: str = "ViT-B/32", device: str = "cuda", batch_size: int = 32):
@@ -22,7 +20,14 @@ class VideoEncoder:
             self.backend = "hf"
             self.model, self.processor = self._load_hf_vision_model(resolved["path"])
         else:
-            self.model, self.preprocess = clip.load(resolved["path"], device=self.device)
+            try:
+                import clip as openai_clip
+            except ImportError as exc:
+                raise RuntimeError(
+                    "The openai-clip package is required for an OpenAI CLIP checkpoint. "
+                    "Use the local Hugging Face CLIP path for main_v2."
+                ) from exc
+            self.model, self.preprocess = openai_clip.load(resolved["path"], device=self.device)
         self.model.eval()
         self.model = self.model.to(self.device, dtype=self.dtype if self.device.type == "cuda" else torch.float32)
 

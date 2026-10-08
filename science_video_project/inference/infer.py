@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, help="Path to trained checkpoint, e.g. outputs/checkpoints/best.pt")
     parser.add_argument("--metadata", default=str(CFG.metadata_csv), help="Metadata csv path")
     parser.add_argument("--output", default="", help="Optional output json path")
+    parser.add_argument(
+        "--llm-online-enroll",
+        action="store_true",
+        help="Allow one DeepSeek request when this video's cache entry is missing.",
+    )
     return parser.parse_args()
 
 
@@ -103,12 +108,18 @@ def load_model(
         ),
         "use_audio_feature": bool(ckpt.get("use_audio_feature", True)),
         "use_cover_features": bool(model_config.get("use_cover_features", False)),
+        "technical_feature_mode": str(model_config.get("technical_feature_mode", "full")),
+        "aesthetic_feature_backend": str(
+            ckpt.get("training_config", {}).get("aesthetic_feature_backend", "legacy")
+        ),
         "video_dim": int(model_config.get("video_dim", CFG.video_dim)),
     } if isinstance(ckpt, dict) else {
         "science_feature_mode": "full_ifg",
         "llm_text_source": "reasoning_and_analysis" if CFG.llm_include_reasoning else "analysis",
         "use_audio_feature": True,
         "use_cover_features": False,
+        "technical_feature_mode": "full",
+        "aesthetic_feature_backend": "legacy",
         "video_dim": CFG.video_dim,
     }
     return model, threshold, runtime_config
@@ -130,24 +141,29 @@ def apply_science_feature_mode(
     return inputs
 
 
-def _build_llm_extractor():
-    from pipeline.step_llm_knowledge import DummyLLMKnowledgeExtractor, LLMKnowledgeExtractor
+def _build_llm_extractor(allow_online_enroll: bool = False):
+    from pipeline.step_llm_knowledge import LLMKnowledgeExtractor
 
     api_key = CFG.llm_api_key or os.environ.get("DEEPSEEK_API_KEY", "")
-    if CFG.use_llm_knowledge and api_key:
-        return LLMKnowledgeExtractor(
-            api_key=api_key,
-            model=CFG.llm_model_name,
-            api_base=CFG.llm_api_base,
-            cache_dir=CFG.llm_cache_dir,
-            temperature=CFG.llm_temperature,
-        )
-    return DummyLLMKnowledgeExtractor()
+    if allow_online_enroll and not api_key:
+        raise RuntimeError("--llm-online-enroll requires DEEPSEEK_API_KEY.")
+    return LLMKnowledgeExtractor(
+        api_key=api_key if allow_online_enroll else None,
+        model=CFG.llm_model_name,
+        api_base=CFG.llm_api_base,
+        cache_dir=CFG.llm_cache_dir,
+        temperature=CFG.llm_temperature,
+        cache_policy="prefer" if allow_online_enroll else "require",
+    )
 
 
 def main() -> None:
     from pipeline.build_sample import build_sample
-    from pipeline.step_aesthetic_clip import CLIPAestheticScorer, DEFAULT_PROMPTS
+    from pipeline.step_aesthetic_clip import (
+        CLIPAestheticScorer,
+        DEFAULT_PROMPTS,
+        SharedCLIPAestheticScorer,
+    )
     from pipeline.step_audio import AudioEncoder
     from pipeline.step_dnsmos import DNSMOSScorer
     from pipeline.step_extract import VideoExtractor
@@ -198,14 +214,22 @@ def main() -> None:
     audio_path = _validate_model_path(CFG.audio_model_path, "Audio")
 
     extractor = VideoExtractor(audio_sr=CFG.audio_sr)
-    text_encoder = TextEncoder(CFG.text_model_name, asr_path, CFG.device, CFG.local_files_only)
     video_encoder = VideoEncoder(CFG.clip_model_name, CFG.device)
-    audio_encoder = AudioEncoder(audio_path, CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
     meta_builder = MetaFeatureBuilder(categories=categories + [row["category"]], out_dim=CFG.meta_dim)
-    aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
-    dnsmos_scorer = DNSMOSScorer(device=CFG.device)
+    if runtime_config["aesthetic_feature_backend"] == "shared_clip":
+        aes_scorer = SharedCLIPAestheticScorer(
+            CFG.clip_model_name, prompts=DEFAULT_PROMPTS, device=CFG.device
+        )
+    else:
+        aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
+    text_encoder = TextEncoder(CFG.text_model_name, asr_path, CFG.device, CFG.local_files_only)
+    audio_encoder = AudioEncoder(audio_path, CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
+    use_dnsmos = runtime_config["technical_feature_mode"] in {
+        "full", "visual_dnsmos", "dnsmos_only"
+    }
+    dnsmos_scorer = DNSMOSScorer(device=CFG.device) if use_dnsmos else None
     sci_hand_extractor = ScienceFeatureExtractor()
-    llm_extractor = _build_llm_extractor()
+    llm_extractor = _build_llm_extractor(args.llm_online_enroll)
 
     wav_path = CFG.audio_dir / f"{video_id}.wav"
     frame_path = CFG.frame_dir / video_id
@@ -231,12 +255,20 @@ def main() -> None:
     audio_feat = audio_encoder.encode(str(wav_path))
     meta_feat = meta_builder.build(row)
 
-    aes_result = aes_scorer.score_frames_batched(frame_path)
+    aes_result = (
+        aes_scorer.score_frame_features(frame_features)
+        if runtime_config["aesthetic_feature_backend"] == "shared_clip"
+        else aes_scorer.score_frames_batched(frame_path)
+    )
     aes_feat = torch.tensor(
         [aes_result["dimensions"][n] for n in aes_result["dimensions"].keys()],
         dtype=torch.float32,
     )
-    dnsmos_feat = dnsmos_scorer.score(str(wav_path))
+    dnsmos_feat = (
+        dnsmos_scorer.score(str(wav_path))
+        if dnsmos_scorer is not None
+        else torch.zeros(CFG.dnsmos_dim, dtype=torch.float32)
+    )
 
     subtitle_text = text_result.subtitle or ""
     audio_duration = 0.0

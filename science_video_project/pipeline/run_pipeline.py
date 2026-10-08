@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import sys
@@ -17,13 +18,18 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from pipeline.build_sample import build_sample
 from pipeline.config import CFG
-from pipeline.step_aesthetic_clip import CLIPAestheticScorer, DEFAULT_PROMPTS
+from pipeline.profiles import PROFILES, get_profile
+from pipeline.step_aesthetic_clip import (
+    CLIPAestheticScorer,
+    DEFAULT_PROMPTS,
+    SharedCLIPAestheticScorer,
+)
 from pipeline.step_audio import AudioEncoder
 from pipeline.step_dnsmos import DNSMOSScorer
 from pipeline.step_extract import VideoExtractor
 from pipeline.step_meta import MetaFeatureBuilder
 from pipeline.step_science_features import ScienceFeatureExtractor
-from pipeline.step_llm_knowledge import LLMKnowledgeExtractor, DummyLLMKnowledgeExtractor
+from pipeline.step_llm_knowledge import LLMKnowledgeExtractor
 from pipeline.step_speech_features import (
     TranscriptResult,
     compute_speech_features,
@@ -99,8 +105,17 @@ def _build_logger(log_file: Path) -> logging.Logger:
     return logger
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Extract science-video features")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="main_v2")
+    parser.add_argument("--force", action="store_true", help="Rebuild existing feature files.")
+    return parser.parse_args()
+
+
 def main() -> None:
     try:
+        args = parse_args()
+        profile = get_profile(args.profile)
         set_seed(CFG.seed)
         ensure_dir(CFG.output_dir)
         ensure_dir(CFG.frame_dir)
@@ -113,9 +128,63 @@ def main() -> None:
         metadata = load_metadata(CFG.metadata_csv)
         row_map = {str(row.video_id): row.to_dict() for _, row in metadata.iterrows()}
 
-        videos = list_videos(CFG.video_dir)
-        if not videos:
+        all_videos = list_videos(CFG.video_dir)
+        if not all_videos:
             raise FileNotFoundError(f"No video files found in: {CFG.video_dir}")
+
+        video_by_id: dict[str, Path] = {}
+        duplicate_video_files = 0
+        for video_path in all_videos:
+            video_id = get_video_id(video_path)
+            if video_id in video_by_id:
+                duplicate_video_files += 1
+                continue
+            video_by_id[video_id] = video_path
+
+        matched_ids = [video_id for video_id in row_map if video_id in video_by_id]
+        missing_video_ids = set(row_map) - set(video_by_id)
+        existing_ids = set()
+        for video_id in matched_ids:
+            feature_path = CFG.feature_dir / f"{video_id}.pt"
+            if not feature_path.exists():
+                continue
+            if profile.use_cover_technical:
+                sample = torch.load(feature_path, map_location="cpu", weights_only=False)
+                value = sample.get("cover_technical_feat")
+                if value is None or np.asarray(value).shape != (CFG.cover_technical_dim,):
+                    continue
+            existing_ids.add(video_id)
+        process_ids = (
+            [video_id for video_id in matched_ids if video_id not in existing_ids]
+            if CFG.skip_existing and not args.force
+            else matched_ids
+        )
+        videos = [video_by_id[video_id] for video_id in process_ids]
+        logger.info(
+            "Feature extraction coverage: metadata=%d | matched_videos=%d | "
+            "existing=%d | pending=%d | files_on_disk=%d",
+            len(row_map),
+            len(matched_ids),
+            len(existing_ids),
+            len(matched_ids) - len(existing_ids),
+            len(all_videos),
+        )
+        logger.info(
+            "Profile=%s | llm=%s | cover=%s | cover_technical=%s | dnsmos=%s | aesthetic=%s",
+            profile.name,
+            profile.llm_cache_policy,
+            profile.use_cover,
+            profile.use_cover_technical,
+            profile.use_dnsmos,
+            profile.aesthetic_backend,
+        )
+        if missing_video_ids:
+            logger.warning("Metadata videos missing on disk: %d", len(missing_video_ids))
+        if duplicate_video_files:
+            logger.warning("Duplicate video files sharing a video ID: %d", duplicate_video_files)
+        if not videos:
+            logger.info("No pending videos for profile %s; exiting before model loading.", profile.name)
+            return
 
         meta_builder = MetaFeatureBuilder(categories=metadata["category"].tolist(), out_dim=CFG.meta_dim)
         if CFG.ffmpeg_path:
@@ -134,44 +203,50 @@ def main() -> None:
             raise FileNotFoundError(f"Audio model path not found: {audio_path_obj}")
 
         extractor = VideoExtractor(audio_sr=CFG.audio_sr)
-        text_encoder = TextEncoder(CFG.text_model_name, asr_path, CFG.device, CFG.local_files_only)
         video_encoder = VideoEncoder(CFG.clip_model_name, CFG.device)
+        if profile.aesthetic_backend == "shared_clip":
+            aes_scorer = SharedCLIPAestheticScorer(
+                CFG.clip_model_name,
+                prompts=DEFAULT_PROMPTS,
+                device=CFG.device,
+            )
+        else:
+            aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
+        text_encoder = TextEncoder(CFG.text_model_name, asr_path, CFG.device, CFG.local_files_only)
         audio_encoder = AudioEncoder(audio_path, CFG.device, out_dim=CFG.audio_dim, shared_model=text_encoder.asr)
-        aes_scorer = CLIPAestheticScorer(prompts=DEFAULT_PROMPTS, device=CFG.device)
-        dnsmos_scorer = DNSMOSScorer(device=CFG.device)
+        dnsmos_scorer = DNSMOSScorer(device=CFG.device) if profile.use_dnsmos else None
+
+        cover_extractor = None
+        if profile.use_cover:
+            from pipeline.step_cover import COVERFeatureExtractor
+
+            cover_extractor = COVERFeatureExtractor(CFG.cover_root, device=CFG.device)
+
+        cover_technical_extractor = None
+        if profile.use_cover_technical:
+            from pipeline.step_cover_technical import COVERTechnicalFeatureExtractor
+
+            cover_technical_extractor = COVERTechnicalFeatureExtractor(
+                CFG.cover_root, device=CFG.device
+            )
 
         # ── §7+ LLM 知识科学性特征提取器 ──
         sci_hand_extractor = ScienceFeatureExtractor()
-        api_key = CFG.llm_api_key or os.environ.get("DEEPSEEK_API_KEY", "")
-        if CFG.use_llm_knowledge and api_key:
-            llm_extractor = LLMKnowledgeExtractor(
-                api_key=api_key,
-                model=CFG.llm_model_name,
-                api_base=CFG.llm_api_base,
-                cache_dir=CFG.llm_cache_dir,
-                temperature=CFG.llm_temperature,
-            )
-        else:
-            llm_extractor = DummyLLMKnowledgeExtractor()
-            if CFG.use_llm_knowledge and not api_key:
-                logger.warning("LLM knowledge enabled but no API key — using DummyLLM fallback")
+        llm_extractor = LLMKnowledgeExtractor(
+            api_key=None,
+            model=CFG.llm_model_name,
+            api_base=CFG.llm_api_base,
+            cache_dir=CFG.llm_cache_dir,
+            temperature=CFG.llm_temperature,
+            cache_policy=profile.llm_cache_policy,
+        )
 
         processed = 0
         skipped = 0
 
         for video_path in tqdm(videos, desc="Extracting features"):
             video_id = get_video_id(video_path)
-            if video_id not in row_map:
-                skipped += 1
-                logger.warning("Skip %s: not found in metadata", video_id)
-                continue
-
             out_pt = CFG.feature_dir / f"{video_id}.pt"
-            if CFG.skip_existing and out_pt.exists():
-                skipped += 1
-                logger.info("Skip %s: feature exists", video_id)
-                continue
-
             row = row_map[video_id]
             wav_path = CFG.audio_dir / f"{video_id}.wav"
             frame_path = CFG.frame_dir / video_id
@@ -196,7 +271,11 @@ def main() -> None:
             meta_feat = meta_builder.build(row)
 
             # CLIP prompt-based aesthetic scoring → (D,)-dim feature vector
-            aes_result = aes_scorer.score_frames_batched(frame_path)
+            aes_result = (
+                aes_scorer.score_frame_features(frame_features)
+                if profile.aesthetic_backend == "shared_clip"
+                else aes_scorer.score_frames_batched(frame_path)
+            )
             dim_names = list(aes_result["dimensions"].keys())
             aes_feat = torch.tensor(
                 [aes_result["dimensions"][n] for n in dim_names],
@@ -204,7 +283,22 @@ def main() -> None:
             )  # shape: (D,)
 
             # DNSMOS 客观音频质量评分 → (3,) [ovrl_mos, sig_mos, bak_mos]
-            dnsmos_feat = dnsmos_scorer.score(str(wav_path))
+            dnsmos_feat = (
+                dnsmos_scorer.score(str(wav_path))
+                if dnsmos_scorer is not None
+                else torch.zeros(CFG.dnsmos_dim, dtype=torch.float32)
+            )
+
+            cover_feat = (
+                cover_extractor.score(video_path)
+                if cover_extractor is not None
+                else None
+            )
+            cover_technical_feat = (
+                cover_technical_extractor.extract(video_path)
+                if cover_technical_extractor is not None
+                else None
+            )
 
             subtitle_text = text_result.subtitle or ""
             save_transcript(
@@ -267,9 +361,34 @@ def main() -> None:
                 llm_analysis_feat=llm_analysis_feat,
                 llm_analysis_only_feat=llm_analysis_only_feat,
                 llm_reasoning_analysis_feat=llm_reasoning_analysis_feat,
+                cover_feat=cover_feat,
                 frame_features=frame_features,
             )
             sample["clip_sampling_version"] = f"global_uniform_{CFG.clip_max_frames}_v1"
+            sample["pipeline_profile"] = profile.name
+            sample["llm_cache_policy"] = profile.llm_cache_policy
+            sample["llm_feature_valid"] = bool(llm_details.is_valid)
+            sample["llm_model"] = llm_details.model
+            sample["dnsmos_enabled"] = profile.use_dnsmos
+            sample["technical_feature_mode"] = profile.technical_feature_mode
+            sample["science_fusion_mode"] = profile.science_fusion_mode
+            sample["aesthetic_backend"] = profile.aesthetic_backend
+            sample["aes_feature_version"] = str(
+                aes_result.get("feature_version", "legacy_openai_clip_vitb32_v1")
+            )
+            if profile.aesthetic_backend == "shared_clip":
+                sample["aes_shared_clip_feat"] = aes_feat.numpy()
+                sample["aes_shared_clip_version"] = aes_scorer.FEATURE_VERSION
+            if cover_extractor is not None:
+                sample["cover_feature_version"] = cover_extractor.FEATURE_VERSION
+            if cover_technical_feat is not None:
+                sample["cover_technical_feat"] = cover_technical_feat.numpy()
+                sample["cover_technical_feature_version"] = (
+                    cover_technical_extractor.FEATURE_VERSION
+                )
+                sample["cover_technical_feature_dim"] = (
+                    cover_technical_extractor.FEATURE_DIM
+                )
             save_pt(sample, out_pt)
             processed += 1
 
